@@ -189,9 +189,17 @@ async function handleFolderUpload() {
   <div class="card-body">
     <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-6">
       <div class="space-y-2">
-        <h1 class="text-3xl font-bold bg-gradient-to-r from-primary to-secondary bg-clip-text text-transparent">
-          {$t("dashboard.header.title")}
-        </h1>
+        <div class="flex items-center gap-3">
+          <h1 class="text-3xl font-bold bg-gradient-to-r from-primary to-secondary bg-clip-text text-transparent">
+            {$t("dashboard.header.title")}
+          </h1>
+          <span class="text-sm text-base-content/50">
+            v{__APP_VERSION__}
+            {#if __GIT_COMMIT__ !== "unknown"}
+              <span class="text-base-content/40">({__GIT_COMMIT__.slice(0, 7)})</span>
+            {/if}
+          </span>
+        </div>
         <p class="text-lg text-base-content/70">
           {$t("dashboard.header.description")}
         </p>
@@ -219,7 +227,14 @@ async function handleFolderUpload() {
             </div>
             
             <!-- Overall Progress Bar -->
-            <div class="w-full bg-base-300 rounded-full h-2 mb-2">
+            <div
+              class="w-full bg-base-300 rounded-full h-2 mb-2"
+              role="progressbar"
+              aria-valuenow={Math.round($uploadStore.totalProgress)}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-label="Upload progress"
+            >
               <div
                 class="bg-primary h-2 rounded-full transition-all duration-300"
                 style="width: {$uploadStore.totalProgress}%"

@@ -5,23 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
-	"path/filepath"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/javi11/nntppool/v2"
-	"github.com/javi11/postie/pkg/parpardownloader"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	defaultPar2Path       = "./parpar"
-	defaultVolumeSize     = 153600000 // 150MB
-	defaultRedundancy     = "1n*1.2"  //https://github.com/animetosho/ParPar/blob/6feee4dd94bb18480f0bf08cd9d17ffc7e671b69/help-full.txt#L75
-	defaultMaxInputSlices = 4000
+	defaultRedundancy = "1n*1.2" //https://github.com/animetosho/ParPar/blob/6feee4dd94bb18480f0bf08cd9d17ffc7e671b69/help-full.txt#L75
 	// CurrentConfigVersion represents the current configuration version
 	CurrentConfigVersion = 1
 )
@@ -182,15 +174,10 @@ type ConfigData struct {
 }
 
 type Par2Config struct {
-	Enabled           *bool     `yaml:"enabled" json:"enabled"`
-	Par2Path          string    `yaml:"par2_path" json:"par2_path"`
-	Redundancy        string    `yaml:"redundancy" json:"redundancy"`
-	VolumeSize        int       `yaml:"volume_size" json:"volume_size"`
-	MaxInputSlices    int       `yaml:"max_input_slices" json:"max_input_slices"`
-	ExtraPar2Options  []string  `yaml:"extra_par2_options" json:"extra_par2_options"`
-	TempDir           string    `yaml:"temp_dir" json:"temp_dir"`
-	MaintainPar2Files *bool     `yaml:"maintain_par2_files" json:"maintain_par2_files"`
-	once              sync.Once `json:"-"`
+	Enabled           *bool  `yaml:"enabled" json:"enabled"`
+	Redundancy        string `yaml:"redundancy" json:"redundancy"`
+	TempDir           string `yaml:"temp_dir" json:"temp_dir"`
+	MaintainPar2Files *bool  `yaml:"maintain_par2_files" json:"maintain_par2_files"`
 }
 
 // ServerConfig represents a Usenet server configuration
@@ -235,6 +222,15 @@ type PostCheck struct {
 	RetryDelay Duration `yaml:"delay" json:"delay"`
 	// The maximum number of re-posts if article check fails. Default value is `1`.
 	MaxRePost uint `yaml:"max_reposts" json:"max_reposts"`
+	// Initial delay before first deferred recheck. Default value is `5m`.
+	// Auto-enabled when PostCheck.Enabled is true.
+	DeferredCheckDelay Duration `yaml:"deferred_check_delay" json:"deferred_check_delay"`
+	// Maximum number of deferred check retry attempts. Default value is `5`.
+	DeferredMaxRetries int `yaml:"deferred_max_retries" json:"deferred_max_retries"`
+	// Maximum backoff cap for deferred checks. Default value is `1h`.
+	DeferredMaxBackoff Duration `yaml:"deferred_max_backoff" json:"deferred_max_backoff"`
+	// Worker poll interval for deferred checks. Default value is `2m`.
+	DeferredCheckInterval Duration `yaml:"deferred_check_interval" json:"deferred_check_interval"`
 }
 
 // NewsgroupConfig represents a single newsgroup configuration
@@ -271,6 +267,10 @@ type WatcherConfig struct {
 	DeleteOriginalFile bool           `yaml:"delete_original_file" json:"delete_original_file"`
 	// If true, creates one NZB per folder instead of one NZB per file in watch mode. Default value is `false`.
 	SingleNzbPerFolder bool `yaml:"single_nzb_per_folder" json:"single_nzb_per_folder"`
+	// FollowSymlinks controls whether symbolic links are followed during directory scanning.
+	// If false (default), symlinks are skipped to avoid double-counting files and including
+	// files outside the watch directory. Set to true to process symlinks as regular files.
+	FollowSymlinks bool `yaml:"follow_symlinks" json:"follow_symlinks"`
 }
 
 type ScheduleConfig struct {
@@ -325,12 +325,6 @@ type PostUploadScriptConfig struct {
 	MaxRetryDuration Duration `yaml:"max_retry_duration" json:"max_retry_duration"`
 	// How often to check for pending retries. Default value is `1m`.
 	RetryCheckInterval Duration `yaml:"retry_check_interval" json:"retry_check_interval"`
-}
-
-// Par2DownloadStatus represents the status of par2 executable download
-type Par2DownloadStatus struct {
-	Status  string `json:"status"`  // "downloading", "completed", "error"
-	Message string `json:"message"` // Human readable message
 }
 
 // ProgressStatus represents the progress of file processing operations
@@ -460,20 +454,22 @@ func Load(path string) (*ConfigData, error) {
 		cfg.PostCheck.Enabled = &enabled
 	}
 
-	if cfg.Par2.Par2Path == "" {
-		cfg.Par2.Par2Path = "./" + filepath.Join(filepath.Dir(path), defaultPar2Path)
+	// Set defaults for deferred post check fields
+	if cfg.PostCheck.DeferredCheckDelay == "" {
+		cfg.PostCheck.DeferredCheckDelay = Duration("5m")
 	}
-
-	if cfg.Par2.VolumeSize <= 0 {
-		cfg.Par2.VolumeSize = defaultVolumeSize
+	if cfg.PostCheck.DeferredMaxRetries == 0 {
+		cfg.PostCheck.DeferredMaxRetries = 5
+	}
+	if cfg.PostCheck.DeferredMaxBackoff == "" {
+		cfg.PostCheck.DeferredMaxBackoff = Duration("1h")
+	}
+	if cfg.PostCheck.DeferredCheckInterval == "" {
+		cfg.PostCheck.DeferredCheckInterval = Duration("2m")
 	}
 
 	if cfg.Par2.Redundancy == "" {
 		cfg.Par2.Redundancy = defaultRedundancy
-	}
-
-	if cfg.Par2.MaxInputSlices <= 0 {
-		cfg.Par2.MaxInputSlices = defaultMaxInputSlices
 	}
 
 	// Set default for maintain par2 files (default to false to preserve current behavior)
@@ -625,37 +621,6 @@ func (c *ConfigData) GetCheckOnlyServers() []ServerConfig {
 	return servers
 }
 
-// validateProxyURL validates SOCKS5 proxy URL format
-// Accepts: socks5://hostname:port or hostname:port (assumes socks5://)
-func validateProxyURL(proxyURL string) error {
-	if proxyURL == "" {
-		return nil // Empty is valid (no proxy)
-	}
-
-	// Add socks5:// prefix if missing
-	if !strings.HasPrefix(proxyURL, "socks5://") {
-		proxyURL = "socks5://" + proxyURL
-	}
-
-	// Parse as URL
-	parsedURL, err := url.Parse(proxyURL)
-	if err != nil {
-		return fmt.Errorf("invalid URL format: %w", err)
-	}
-
-	// Validate scheme
-	if parsedURL.Scheme != "socks5" {
-		return fmt.Errorf("only socks5:// scheme is supported, got: %s", parsedURL.Scheme)
-	}
-
-	// Validate host is present
-	if parsedURL.Host == "" {
-		return fmt.Errorf("proxy URL must include hostname and port")
-	}
-
-	return nil
-}
-
 // serverConfigToProviderConfig converts a ServerConfig to nntppool.UsenetProviderConfig
 func serverConfigToProviderConfig(s ServerConfig) nntppool.UsenetProviderConfig {
 	maxConnections := s.MaxConnections
@@ -805,24 +770,7 @@ func (c *ConfigData) GetCheckPool() (nntppool.UsenetConnectionPool, error) {
 	return pool, nil
 }
 
-func (c *ConfigData) GetPar2Config(ctx context.Context) (*Par2Config, error) {
-	var errDownload error
-	c.Par2.once.Do(func() {
-		par2ExePath, err := ensurePar2Executable(ctx, c.Par2.Par2Path)
-		if err != nil {
-			slog.ErrorContext(ctx, "Error ensuring par2 executable", "error", err)
-			errDownload = fmt.Errorf("error ensuring par2 executable: %w", err)
-
-			return
-		}
-
-		c.Par2.Par2Path = par2ExePath
-	})
-
-	if errDownload != nil {
-		return nil, errDownload
-	}
-
+func (c *ConfigData) GetPar2Config(_ context.Context) (*Par2Config, error) {
 	return &c.Par2, nil
 }
 
@@ -832,29 +780,6 @@ func (c *ConfigData) GetPostingConfig() PostingConfig {
 
 func (c *ConfigData) GetPostCheckConfig() PostCheck {
 	return c.PostCheck
-}
-
-// ensurePar2Executable checks if a par2 executable is configured, downloads one if necessary,
-// and returns the final path to the executable.
-func ensurePar2Executable(ctx context.Context, par2Path string) (string, error) {
-	slog.DebugContext(ctx, "Using configured Par2 executable", "path", par2Path)
-	// Verify it exists?
-	if _, err := os.Stat(par2Path); err == nil {
-		return par2Path, nil
-	}
-
-	slog.WarnContext(ctx, "Configured Par2 executable not found, proceeding to download", "path", par2Path)
-
-	// Download if not configured and not found in default path
-	slog.InfoContext(ctx, "No par2 executable configured or found, downloading parpar...")
-	execPath, err := parpardownloader.DownloadParParCmd(par2Path)
-	if err != nil {
-		return "", fmt.Errorf("failed to download parpar: %w", err)
-	}
-
-	slog.InfoContext(ctx, "Downloaded Par2 executable", "path", execPath)
-
-	return execPath, nil
 }
 
 func (c *ConfigData) GetWatcherConfig() WatcherConfig {
@@ -913,17 +838,17 @@ func GetDefaultConfig() ConfigData {
 			GroupPolicy:           GroupPolicyEachFile,
 		},
 		PostCheck: PostCheck{
-			Enabled:    &enabled,
-			RetryDelay: Duration("10s"),
-			MaxRePost:  1,
+			Enabled:               &enabled,
+			RetryDelay:            Duration("10s"),
+			MaxRePost:             1,
+			DeferredCheckDelay:    Duration("5m"),
+			DeferredMaxRetries:    5,
+			DeferredMaxBackoff:    Duration("1h"),
+			DeferredCheckInterval: Duration("2m"),
 		},
 		Par2: Par2Config{
 			Enabled:           &enabled,
-			Par2Path:          defaultPar2Path,
 			Redundancy:        defaultRedundancy,
-			VolumeSize:        defaultVolumeSize,
-			MaxInputSlices:    defaultMaxInputSlices,
-			ExtraPar2Options:  []string{},
 			TempDir:           os.TempDir(),
 			MaintainPar2Files: &disabled, // Default to false to preserve current behavior
 		},
@@ -940,6 +865,7 @@ func GetDefaultConfig() ConfigData {
 			CheckInterval:      Duration("5m"),
 			DeleteOriginalFile: false, // Default to keeping original files for safety
 			SingleNzbPerFolder: false, // Default to false for backward compatibility
+			FollowSymlinks:     false, // Default to skipping symlinks to avoid double-counting and external files
 		},
 		NzbCompression: NzbCompressionConfig{
 			Enabled: disabled,
@@ -972,7 +898,7 @@ func GetDefaultConfig() ConfigData {
 func SaveConfig(configData *ConfigData, path string) error {
 	data, err := yaml.Marshal(configData)
 	if err != nil {
-		return fmt.Errorf("Invalid configuration format: %v", err)
+		return fmt.Errorf("invalid configuration format: %v", err)
 	}
 
 	if err := os.WriteFile(path, data, 0644); err != nil {

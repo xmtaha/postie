@@ -15,6 +15,7 @@
             "save_configuration": "Yapılandırmayı Kaydet",
             "advanced_mode": "Gelişmiş Mod",
             "advanced_mode_description": "İnce ayar için gelişmiş yapılandırma seçeneklerini göster",
+            "unsaved_changes": "Kaydedilmemiş değişiklikler",
             "status": {
                 "configuration_error": "Yapılandırma Hatası",
                 "configuration_required": "Yapılandırma Gerekli",
@@ -169,8 +170,6 @@
             "title": "PAR2 Kurtarma Dosyaları",
             "enable": "PAR2 oluşturmayı etkinleştir",
             "enable_description": "Hata düzeltme ve onarım için kurtarma dosyaları oluştur",
-            "par2_path": "PAR2 Yürütülebilir Yolu",
-            "par2_path_description": "PAR2 yürütülebilir dosyası veya parpar yolu",
             "temp_dir": "Geçici Dizin",
             "temp_dir_description": "İşleme sırasında PAR2 dosyalarının geçici olarak oluşturulduğu dizin (varsayılan olarak sistem geçici dizinini kullanır)",
             "temp_dir_placeholder": "Sistem geçici dizini için boş bırakın",
@@ -178,32 +177,16 @@
             "maintain_par2_files_description": "Başarılı yüklemeden sonra PAR2 dosyalarını kalıcı olarak sakla (arşiv bütünlüğü ve gelecekteki onarımlar için yararlıdır)",
             "redundancy": "Yedeklilik",
             "redundancy_description": "Kurtarma verisi yüzdesi",
-            "volume_size": "Bölüm Boyutu",
-            "volume_size_description": "Her bir PAR2 bölüm dosyasının boyutu",
-            "max_input_slices": "Maksimum Giriş Dilimleri",
-            "max_input_slices_description": "İşleme için maksimum giriş dilimi sayısı",
-            "extra_options": {
-                "title": "Ek PAR2 Seçenekleri",
-                "description": "PAR2 yürütülebilir dosyası için ek komut satırı argümanları",
-                "add_option": "Seçenek Ekle",
-                "remove": "Kaldır",
-                "placeholder": "--option=value",
-                "no_options": "Ek seçenek yapılandırılmadı. Gerekirse özel PAR2 argümanları ekleyin."
-            },
             "info": {
                 "title": "PAR2 Kurtarma Bilgisi",
                 "features": {
                     "par2_files_allow_recovery_of_damaged_or_missing_files": "PAR2 dosyaları hasarlı veya eksik dosyaların kurtarılmasını sağlar",
                     "redundancy_percentage_determines_how_much_data_can_be_recovered": "Yedeklilik yüzdesi ne kadar verinin kurtarılabileceğini belirler",
-                    "higher_redundancy_better_recovery_but_larger_par2_files": "Daha yüksek yedeklilik = daha iyi kurtarma ancak daha büyük PAR2 dosyaları",
-                    "volume_size_controls_how_par2_data_is_split_across_files": "Bölüm boyutu PAR2 verilerinin dosyalar arasında nasıl bölüneceğini kontrol eder",
-                    "extra_options_allow_fine_tuning_of_par2_generation": "Ek seçenekler PAR2 üretiminin ince ayarını sağlar"
+                    "higher_redundancy_better_recovery_but_larger_par2_files": "Daha yüksek yedeklilik = daha iyi kurtarma ancak daha büyük PAR2 dosyaları"
                 }
             },
             "status": {
-                "redundancy": "Yedeklilik",
-                "volume_size": "Bölüm Boyutu",
-                "max_slices": "Maksimum Dilim"
+                "redundancy": "Yedeklilik"
             },
             "save_button": "PAR2 Ayarlarını Kaydet",
             "saving": "Kaydediliyor...",
@@ -224,7 +207,17 @@
             "save_button": "Gönderim Kontrolü Ayarlarını Kaydet",
             "saving": "Kaydediliyor...",
             "saved_success": "Gönderim kontrolü ayarları kaydedildi",
-            "saved_success_description": "Gönderim kontrolü yapılandırmanız başarıyla kaydedildi!"
+            "saved_success_description": "Gönderim kontrolü yapılandırmanız başarıyla kaydedildi!",
+            "deferred_title": "Ertelenmiş Doğrulama",
+            "deferred_info": "Makaleler anlık yeniden gönderimden sonra doğrulanamadığında, yayılma gecikmelerini hesaba katmak için daha sonra yeniden kontrol edilmek üzere kuyruğa alınır. Bu, geçici ağ sorunları veya sunucu yayılma gecikmeleri nedeniyle oluşan hatalı başarısızlıkları önler.",
+            "deferred_check_delay": "İlk Kontrol Gecikmesi",
+            "deferred_check_delay_description": "Ertelenmiş doğrulamanın ilk yeniden kontrolünden önceki bekleme süresi",
+            "deferred_max_retries": "Maksimum Yeniden Deneme",
+            "deferred_max_retries_description": "Başarısız olarak işaretlemeden önce maksimum yeniden deneme sayısı",
+            "deferred_max_backoff": "Maksimum Geri Çekilme",
+            "deferred_max_backoff_description": "Yeniden denemeler arasındaki maksimum bekleme süresi (üstel geri çekilme)",
+            "deferred_check_interval": "Kontrol Aralığı",
+            "deferred_check_interval_description": "Arka plan çalışanının bekleyen kontrolleri yoklama sıklığı"
         },
         "posting": {
             "title": "Gönderim Yapılandırması",

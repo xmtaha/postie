@@ -119,6 +119,7 @@ type App struct {
 	firstStart           bool
 	pendingConfig        *config.ConfigData
 	pendingConfigMux     sync.RWMutex
+	postCheckWorker      *processor.PostCheckRetryWorker
 }
 
 // getCrashLogPath returns the path for crash logs
@@ -271,7 +272,6 @@ func NewApp() *App {
 		appPaths = &AppPaths{
 			Config:   "./config.yaml",
 			Database: "./postie.db",
-			Par2:     "./parpar",
 			Data:     ".",
 			Log:      "./postie.log",
 		}
@@ -292,7 +292,6 @@ func NewApp() *App {
 	slog.Info("Using OS-specific paths",
 		"config", appPaths.Config,
 		"database", appPaths.Database,
-		"par2", appPaths.Par2,
 		"data", appPaths.Data,
 		"log", appPaths.Log,
 		"actualLogPath", actualLogPath)
@@ -327,8 +326,7 @@ func (a *App) Startup(ctx context.Context) {
 	// Note: Directory creation is now handled in GetAppPaths()
 	slog.Info("Application starting with OS-specific paths",
 		"config", a.appPaths.Config,
-		"database", a.appPaths.Database,
-		"par2", a.appPaths.Par2)
+		"database", a.appPaths.Database)
 
 	// Check if it's the first start BEFORE creating any config
 	a.firstStart = a.determineFirstStart()
@@ -376,13 +374,14 @@ func (a *App) Startup(ctx context.Context) {
 		slog.Error(fmt.Sprintf("Failed to initialize processor: %v", err))
 	}
 
+	// Initialize post check retry worker if post check is enabled
+	a.initializePostCheckWorker()
+
 	// Initialize watcher if enabled and configuration is valid
 	if err := a.initializeWatcher(); err != nil {
 		slog.Error(fmt.Sprintf("Failed to initialize watcher: %v", err))
 	}
 
-	// Ensure par2 executable is available
-	go a.ensurePar2Executable(ctx)
 }
 
 // Shutdown gracefully shuts down the application and closes all resources
@@ -390,6 +389,13 @@ func (a *App) Shutdown() {
 	defer a.recoverPanic("Shutdown")
 
 	slog.Info("Application shutdown initiated")
+
+	// Stop post check retry worker if running
+	if a.postCheckWorker != nil {
+		slog.Info("Stopping post check retry worker")
+		a.postCheckWorker.Stop()
+		a.postCheckWorker = nil
+	}
 
 	// Stop watcher if running
 	if a.watcher != nil {
@@ -876,9 +882,6 @@ func (a *App) SetupWizardComplete(wizardData SetupWizardData) error {
 	// Set output directory
 	cfg.OutputDir = wizardData.OutputDirectory
 	slog.Debug("Set output directory", "path", wizardData.OutputDirectory)
-
-	// Set the par2 path to the OS-specific location
-	cfg.Par2.Par2Path = a.appPaths.Par2
 
 	// Set the database path to the OS-specific location
 	cfg.Database.DatabasePath = a.appPaths.Database

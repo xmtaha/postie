@@ -15,6 +15,7 @@
 			"save_configuration": "Sauvegarder la Configuration",
 			"advanced_mode": "Mode Avancé",
 			"advanced_mode_description": "Afficher les options de configuration avancées pour un réglage fin",
+			"unsaved_changes": "Modifications non enregistrées",
 			"status": {
 				"configuration_error": "Erreur de Configuration",
 				"configuration_required": "Configuration Requise",
@@ -164,8 +165,6 @@
 			"title": "Fichiers de Récupération PAR2",
 			"enable": "Activer la génération PAR2",
 			"enable_description": "Générer des fichiers de récupération pour la correction et la réparation d'erreurs",
-			"par2_path": "Chemin de l'Exécutable PAR2",
-			"par2_path_description": "Chemin vers l'exécutable PAR2 ou parpar",
 			"temp_dir": "Répertoire Temporaire",
 			"temp_dir_description": "Répertoire où les fichiers PAR2 sont créés temporairement pendant le traitement (utilise le temp système par défaut)",
 			"temp_dir_placeholder": "Laisser vide pour le répertoire temporaire du système",
@@ -173,32 +172,16 @@
 			"maintain_par2_files_description": "Conserver les fichiers PAR2 de façon permanente après un téléchargement réussi (utile pour l'intégrité des archives et les réparations futures)",
 			"redundancy": "Redondance",
 			"redundancy_description": "Pourcentage de données de récupération",
-			"volume_size": "Taille de Volume",
-			"volume_size_description": "Taille de chaque fichier de volume PAR2",
-			"max_input_slices": "Maximum de Tranches d'Entrée",
-			"max_input_slices_description": "Nombre maximum de tranches d'entrée pour le traitement",
-			"extra_options": {
-				"title": "Options PAR2 Supplémentaires",
-				"description": "Arguments de ligne de commande supplémentaires pour l'exécutable PAR2",
-				"add_option": "Ajouter une Option",
-				"remove": "Supprimer",
-				"placeholder": "--option=valeur",
-				"no_options": "Aucune option supplémentaire configurée. Ajoutez des arguments PAR2 personnalisés si nécessaire."
-			},
 			"info": {
 				"title": "Informations de Récupération PAR2",
 				"features": {
 					"par2_files_allow_recovery_of_damaged_or_missing_files": "Les fichiers PAR2 permettent la récupération de fichiers endommagés ou manquants",
 					"redundancy_percentage_determines_how_much_data_can_be_recovered": "Le pourcentage de redondance détermine combien de données peuvent être récupérées",
-					"higher_redundancy_better_recovery_but_larger_par2_files": "Plus de redondance = meilleure récupération mais fichiers PAR2 plus volumineux",
-					"volume_size_controls_how_par2_data_is_split_across_files": "La taille de volume contrôle comment les données PAR2 sont divisées entre les fichiers",
-					"extra_options_allow_fine_tuning_of_par2_generation": "Les options supplémentaires permettent l'ajustement fin de la génération PAR2"
+					"higher_redundancy_better_recovery_but_larger_par2_files": "Plus de redondance = meilleure récupération mais fichiers PAR2 plus volumineux"
 				}
 			},
 			"status": {
-				"redundancy": "Redondance",
-				"volume_size": "Taille de Volume",
-				"max_slices": "Max. Tranches"
+				"redundancy": "Redondance"
 			},
 			"save_button": "Sauvegarder les Paramètres PAR2",
 			"saving": "Sauvegarde...",
@@ -214,6 +197,16 @@
 			"check_delay_description": "Délai avant de vérifier si les articles sont disponibles (ex., 10s, 30s, 1m)",
 			"max_reposts": "Maximum de Re-publications",
 			"max_reposts_description": "Nombre maximum de fois pour réessayer la publication si la vérification d'article échoue",
+			"deferred_title": "Vérification Différée",
+			"deferred_info": "Lorsque la vérification immédiate échoue après toutes les tentatives, les articles sont mis en file d'attente pour une revérification différée. Cela tient compte des délais de propagation Usenet.",
+			"deferred_check_delay": "Délai Initial de Revérification",
+			"deferred_check_delay_description": "Temps d'attente avant la première revérification différée (ex., 5m, 10m)",
+			"deferred_max_retries": "Maximum de Tentatives Différées",
+			"deferred_max_retries_description": "Nombre maximum de tentatives de revérification différée avant de marquer comme échoué",
+			"deferred_max_backoff": "Délai Maximum",
+			"deferred_max_backoff_description": "Délai maximum entre les revérifications différées (plafond de recul exponentiel)",
+			"deferred_check_interval": "Intervalle de Sondage du Worker",
+			"deferred_check_interval_description": "Fréquence à laquelle le worker vérifie les articles nécessitant une vérification",
 			"info_title": "Vérification Post :",
 			"info_description": "Vérifie la disponibilité des articles après téléchargement pour assurer une propagation réussie. Peut augmenter le temps de téléchargement mais améliore la fiabilité.",
 			"save_button": "Sauvegarder les Paramètres de Vérification",
