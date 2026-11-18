@@ -1,7 +1,7 @@
 services:
   postie:
     container_name: postie
-    image: ghcr.io/javi11/postie:latest
+    image: ghcr.io/kipsilabs/postie:latest
     ports:
       - "8080:8080"
     volumes:
@@ -11,19 +11,14 @@ services:
     environment:
       - PORT=8080
       - HOST=0.0.0.0
+      # Enable administrator login for the web UI and browser APIs.
+      # - POSTIE_AUTH_ENABLED=true
+      # Behind an HTTPS reverse proxy, also set POSTIE_COOKIE_SECURE=true.
       - PUID=1000
       - PGID=1000
     restart: unless-stopped
     healthcheck:
-      test:
-        [
-          "CMD",
-          "wget",
-          "--no-verbose",
-          "--tries=1",
-          "--spider",
-          "http://localhost:8080/live",
-        ]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/live"]
       interval: 30s
       timeout: 10s
       retries: 3

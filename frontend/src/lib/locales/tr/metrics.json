@@ -1,11 +1,22 @@
 {
     "metrics": {
+        "ping_rtt": "Ping gecikmesi (RTT)",
+        "missing": "Eksik",
+        "elapsed": "Havuz çalışma süresi",
+        "avg_speed": "Ortalama hız",
         "title": "Bağlantı Havuzu Metrikleri",
         "description": "Bağlantı havuzunuz için gerçek zamanlı performans ve bağlantı metrikleri",
         "auto_refresh": "Otomatik yenileme",
         "refresh": "Yenile",
         "error_loading": "Metrikler yüklenemedi",
         "error_title": "Metrikler yüklenemiyor",
+        "transfer_runtime": {
+            "title": "Aktarım Çalışma Zamanı",
+            "upload_workers": "Yükleme İşçileri",
+            "buffer_memory": "Tampon Belleği",
+            "par2_jobs": "PAR2 İşleri",
+            "queued": "kuyrukta"
+        },
         "time_period": "Zaman Aralığı",
         "compressed_data": "Sıkıştırılmış Veri",
         "data_source": "Veri Kaynağı",
@@ -40,6 +51,12 @@
         "provider_host": "Ana Bilgisayar/Sunucu",
         "status": "Durum",
         "connections": "Bağlantılar",
+        "current_speed": "Anlık Hız",
+        "ttfb": "TTFB",
+        "downloaded": "İndirilen",
+        "free_slots": "Boş Yuvalar",
+        "quota": "Kota",
+        "quota_exceeded": "Aşıldı",
         "success_rate": "Başarı Oranı",
         "avg_age": "Ort Bağlantı Yaşı",
         "articles_posted": "Gönderilen Makaleler",
@@ -58,5 +75,31 @@
         "server_host": "Sunucu Adresi",
         "data_posted": "Gönderilen Veri",
         "connection_age": "Bağlantı Yaşı"
-    }
+    },
+	"logs": {
+		"search_placeholder": "Günlükleri filtrele",
+		"level_label": "Günlük düzeyi",
+		"level_all": "Tüm düzeyler",
+		"level_info": "Bilgi ve üzeri",
+		"level_warn": "Uyarılar ve hatalar",
+		"level_error": "Yalnızca hatalar",
+		"count": "{count} satır",
+		"count_filtered": "{total} satırın {shown} tanesi",
+		"more_available": "daha eski satırlar var",
+		"jump_to_latest": "En sona git",
+		"loading": "Günlükler yükleniyor…",
+		"loading_older": "Eski günlükler yükleniyor…",
+		"beginning": "Günlüklerin başı",
+		"empty": "Eşleşen günlük satırı yok",
+		"copy": "Kopyala",
+		"copied": "Günlükler panoya kopyalandı",
+		"copy_error": "Günlükler kopyalanamadı"
+	},
+	"errorPage": {
+		"title": "Bir şeyler ters gitti",
+		"description": "Sayfayı yenilemeyi deneyin veya panoya dönün.",
+		"back": "Panoya dön",
+		"reload": "Yenile",
+		"document_title": "Hata {status} - Postie"
+	}
 }

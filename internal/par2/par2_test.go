@@ -5,14 +5,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/javi11/postie/internal/config"
-	"github.com/javi11/postie/internal/progress"
-	"github.com/javi11/postie/pkg/fileinfo"
+	"github.com/kipsilabs/postie/internal/config"
+	"github.com/kipsilabs/postie/internal/progress"
+	"github.com/kipsilabs/postie/pkg/fileinfo"
 )
 
 // mockProgress implements the Progress interface for testing
@@ -71,8 +72,9 @@ func (m *mockProgress) GetStartTime() time.Time { return m.startTime }
 func (m *mockProgress) GetElapsedTime() time.Duration {
 	return time.Since(m.startTime)
 }
-func (m *mockProgress) SetPaused(paused bool) { m.isPaused = paused }
-func (m *mockProgress) IsPaused() bool        { return m.isPaused }
+func (m *mockProgress) SetPaused(paused bool)       { m.isPaused = paused }
+func (m *mockProgress) IsPaused() bool              { return m.isPaused }
+func (m *mockProgress) SetWaitDeadline(_ time.Time) {}
 
 // mockJobProgress implements the JobProgress interface for testing
 type mockJobProgress struct {
@@ -205,6 +207,49 @@ func TestIsPar2File(t *testing.T) {
 	}
 }
 
+// TestComputeFileBlockSize_SIMDAligned is a regression test for the random
+// segfault in CI (run 26437870974). The previous code path produced a
+// 10_000-byte slice size for {articleSize=10_000, file=100 KB, SliceSize=10 MiB},
+// which is not a multiple of the AVX-512 stride (64 bytes) and caused the
+// ParPar C backend to overread past the slice buffer.
+func TestComputeFileBlockSize_SIMDAligned(t *testing.T) {
+	const simdAlignment = uint64(128)
+	cases := []struct {
+		name                string
+		fileSize            uint64
+		articleSize         uint64
+		configuredSliceSize int64
+		wantZero            bool
+	}{
+		{"CI repro: 100KB file, 10K article, 10MiB cfg", 100_000, 10_000, 10 * 1024 * 1024, false},
+		{"100KB file, default article (750K), no cfg", 100_000, 750_000, 0, false},
+		{"10MB file, 512K article", 10 * 1024 * 1024, 512 * 1024, 0, false},
+		{"127-byte file too small", 127, 750_000, 0, true},
+		{"128-byte file is minimum", 128, 750_000, 0, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := computeFileBlockSize(tc.fileSize, tc.articleSize, tc.configuredSliceSize)
+			if tc.wantZero {
+				if got != 0 {
+					t.Errorf("expected 0 (skip), got %d", got)
+				}
+				return
+			}
+			if got == 0 {
+				t.Fatal("expected non-zero block size, got 0")
+			}
+			if got%simdAlignment != 0 {
+				t.Errorf("block size %d is not a multiple of %d — would crash ParPar SIMD backend", got, simdAlignment)
+			}
+			if got > tc.fileSize {
+				t.Errorf("block size %d exceeds file size %d", got, tc.fileSize)
+			}
+		})
+	}
+}
+
 func TestCalculateParBlockSize(t *testing.T) {
 	testCases := []struct {
 		fileSize    uint64
@@ -216,6 +261,11 @@ func TestCalculateParBlockSize(t *testing.T) {
 		{32768*512*1024 - 1, 512 * 1024, 512 * 1024},
 		{32768*512*1024*3 + 1, 512 * 1024, 512 * 1024 * 4},
 		{1024, 512 * 1024, 512 * 1024},
+		// articleSize not a multiple of 4 — must be rounded down
+		{10 * 1024 * 1024, 361254, 361252},
+		{10 * 1024 * 1024, 750001, 750000},
+		// articleSize already a multiple of 4
+		{10 * 1024 * 1024, 750000, 750000},
 	}
 
 	for i, tc := range testCases {
@@ -263,7 +313,9 @@ func TestCreate(t *testing.T) {
 		executor := &NativeExecutor{
 			articleSize: 10000,
 			cfg: &config.Par2Config{
-				Redundancy: "10",
+				Redundancy:  "10",
+				SliceSize:   10 * 1024 * 1024,       // 10 MiB — matches config.Load() default
+				MemoryLimit: 4 * 1024 * 1024 * 1024, // 4 GiB — matches config.Load() default
 			},
 			jobProgress: newMockJobProgress(),
 		}
@@ -272,7 +324,7 @@ func TestCreate(t *testing.T) {
 			{Path: testFile, Size: 100000},
 		}
 
-		createdFiles, err := executor.Create(context.Background(), files)
+		createdFiles, err := all(executor.Create(context.Background(), files))
 		if err != nil {
 			t.Fatalf("Create failed: %v", err)
 		}
@@ -288,13 +340,7 @@ func TestCreate(t *testing.T) {
 		}
 
 		// Verify it's in the returned list
-		found := false
-		for _, f := range createdFiles {
-			if f == expectedPar2File {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(createdFiles, expectedPar2File)
 		if !found {
 			t.Fatalf("Main PAR2 file not in returned list: %v", createdFiles)
 		}
@@ -320,7 +366,9 @@ func TestCreate(t *testing.T) {
 		executor := &NativeExecutor{
 			articleSize: 10000,
 			cfg: &config.Par2Config{
-				Redundancy: "10",
+				Redundancy:  "10",
+				SliceSize:   10 * 1024 * 1024,       // 10 MiB — matches config.Load() default
+				MemoryLimit: 4 * 1024 * 1024 * 1024, // 4 GiB — matches config.Load() default
 			},
 			jobProgress: newMockJobProgress(),
 		}
@@ -330,7 +378,7 @@ func TestCreate(t *testing.T) {
 			{Path: filepath.Join(tempDir, "existing.par2"), Size: 1000},
 		}
 
-		createdFiles, err := executor.Create(context.Background(), files)
+		createdFiles, err := all(executor.Create(context.Background(), files))
 		if err != nil {
 			t.Fatalf("Create failed: %v", err)
 		}
@@ -351,8 +399,7 @@ func TestCreate(t *testing.T) {
 		// Pre-create PAR2 files
 		mainPar2 := filepath.Join(tempDir, "testfile.bin.par2")
 		volPar2 := filepath.Join(tempDir, "testfile.bin.vol00+01.par2")
-		os.WriteFile(mainPar2, []byte("par2 data"), 0644)
-		os.WriteFile(volPar2, []byte("volume data"), 0644)
+		writeRealPar2Files(t, filepath.Dir(mainPar2), testFile, 1)
 
 		executor := &NativeExecutor{
 			articleSize: 10000,
@@ -366,10 +413,14 @@ func TestCreate(t *testing.T) {
 			{Path: testFile, Size: 50000},
 		}
 
-		createdFiles, err := executor.Create(context.Background(), files)
+		res, err := executor.Create(context.Background(), files)
 		if err != nil {
 			t.Fatalf("Create failed: %v", err)
 		}
+		if len(res.Created) != 0 || len(res.Reused) == 0 {
+			t.Fatalf("pre-existing PAR2 must be reported as reused, got Created=%v Reused=%v", res.Created, res.Reused)
+		}
+		createdFiles := res.All()
 
 		// Should return existing files
 		if len(createdFiles) < 2 {
@@ -403,8 +454,10 @@ func TestCreate(t *testing.T) {
 		executor := &NativeExecutor{
 			articleSize: 10000,
 			cfg: &config.Par2Config{
-				Redundancy: "10",
-				TempDir:    tempDir,
+				Redundancy:  "10",
+				TempDir:     tempDir,
+				SliceSize:   10 * 1024 * 1024,       // 10 MiB — matches config.Load() default
+				MemoryLimit: 4 * 1024 * 1024 * 1024, // 4 GiB — matches config.Load() default
 			},
 			jobProgress: newMockJobProgress(),
 		}
@@ -413,7 +466,7 @@ func TestCreate(t *testing.T) {
 			{Path: testFile, Size: 100000},
 		}
 
-		createdFiles, err := executor.Create(context.Background(), files)
+		createdFiles, err := all(executor.Create(context.Background(), files))
 		if err != nil {
 			t.Fatalf("Create failed: %v", err)
 		}
@@ -432,6 +485,71 @@ func TestCreate(t *testing.T) {
 		}
 	})
 
+	t.Run("reuses existing PAR2 files in source dir when TempDir is configured", func(t *testing.T) {
+		sourceDir := t.TempDir()
+		tempDir := t.TempDir()
+		testFile := filepath.Join(sourceDir, "testfile.bin")
+		createTestFile(t, testFile, 50000)
+
+		// Pre-create PAR2 files in the SOURCE directory (not in TempDir)
+		mainPar2 := filepath.Join(sourceDir, "testfile.bin.par2")
+		volPar2 := filepath.Join(sourceDir, "testfile.bin.vol00+01.par2")
+		writeRealPar2Files(t, filepath.Dir(mainPar2), testFile, 1)
+
+		executor := &NativeExecutor{
+			articleSize: 10000,
+			cfg: &config.Par2Config{
+				Redundancy: "10",
+				TempDir:    tempDir, // TempDir is configured but PAR2 is in source dir
+			},
+			jobProgress: newMockJobProgress(),
+		}
+
+		files := []fileinfo.FileInfo{
+			{Path: testFile, Size: 50000},
+		}
+
+		res, err := executor.Create(context.Background(), files)
+		if err != nil {
+			t.Fatalf("Create failed: %v", err)
+		}
+		if len(res.Created) != 0 || len(res.Reused) == 0 {
+			t.Fatalf("pre-existing PAR2 must be reported as reused, got Created=%v Reused=%v", res.Created, res.Reused)
+		}
+		createdFiles := res.All()
+
+		// Should return existing files from source dir, not generate new ones in TempDir
+		if len(createdFiles) < 2 {
+			t.Fatalf("Expected at least 2 existing PAR2 files, got %d", len(createdFiles))
+		}
+
+		foundMain := false
+		foundVol := false
+		for _, f := range createdFiles {
+			if f == mainPar2 {
+				foundMain = true
+			}
+			if f == volPar2 {
+				foundVol = true
+			}
+		}
+		if !foundMain {
+			t.Error("Main PAR2 file from source dir not found in returned paths")
+		}
+		if !foundVol {
+			t.Error("Volume PAR2 file from source dir not found in returned paths")
+		}
+
+		// Verify nothing was created in TempDir
+		entries, err := os.ReadDir(tempDir)
+		if err != nil {
+			t.Fatalf("failed to read temp dir: %v", err)
+		}
+		if len(entries) > 0 {
+			t.Errorf("Expected TempDir to be empty (no new PAR2 generated), but found %d files", len(entries))
+		}
+	})
+
 	t.Run("handles context cancellation", func(t *testing.T) {
 		tempDir := t.TempDir()
 		testFile := filepath.Join(tempDir, "testfile.bin")
@@ -440,7 +558,9 @@ func TestCreate(t *testing.T) {
 		executor := &NativeExecutor{
 			articleSize: 10000,
 			cfg: &config.Par2Config{
-				Redundancy: "10",
+				Redundancy:  "10",
+				SliceSize:   10 * 1024 * 1024,       // 10 MiB — matches config.Load() default
+				MemoryLimit: 4 * 1024 * 1024 * 1024, // 4 GiB — matches config.Load() default
 			},
 			jobProgress: newMockJobProgress(),
 		}
@@ -452,7 +572,7 @@ func TestCreate(t *testing.T) {
 			{Path: testFile, Size: 100000},
 		}
 
-		_, err := executor.Create(ctx, files)
+		_, err := all(executor.Create(ctx, files))
 		if err == nil {
 			t.Error("Expected error from cancelled context")
 		}
@@ -469,7 +589,9 @@ func TestCreateInDirectory(t *testing.T) {
 		executor := &NativeExecutor{
 			articleSize: 10000,
 			cfg: &config.Par2Config{
-				Redundancy: "10",
+				Redundancy:  "10",
+				SliceSize:   10 * 1024 * 1024,       // 10 MiB — matches config.Load() default
+				MemoryLimit: 4 * 1024 * 1024 * 1024, // 4 GiB — matches config.Load() default
 			},
 			jobProgress: newMockJobProgress(),
 		}
@@ -478,7 +600,7 @@ func TestCreateInDirectory(t *testing.T) {
 			{Path: testFile, Size: 100000},
 		}
 
-		createdFiles, err := executor.CreateInDirectory(context.Background(), files, outputDir)
+		createdFiles, err := all(executor.CreateInDirectory(context.Background(), files, outputDir))
 		if err != nil {
 			t.Fatalf("CreateInDirectory failed: %v", err)
 		}
@@ -503,7 +625,9 @@ func TestCreateInDirectory(t *testing.T) {
 	t.Run("uses default behavior when outputDir is empty", func(t *testing.T) {
 		tempDir := t.TempDir()
 		configTempDir := filepath.Join(tempDir, "temp")
-		os.MkdirAll(configTempDir, 0755)
+		if err := os.MkdirAll(configTempDir, 0755); err != nil {
+			t.Fatalf("failed to create temp dir: %v", err)
+		}
 
 		testFile := filepath.Join(tempDir, "testfile.bin")
 		createTestFile(t, testFile, 100000)
@@ -511,8 +635,10 @@ func TestCreateInDirectory(t *testing.T) {
 		executor := &NativeExecutor{
 			articleSize: 10000,
 			cfg: &config.Par2Config{
-				Redundancy: "10",
-				TempDir:    configTempDir,
+				Redundancy:  "10",
+				TempDir:     configTempDir,
+				SliceSize:   10 * 1024 * 1024,       // 10 MiB — matches config.Load() default
+				MemoryLimit: 4 * 1024 * 1024 * 1024, // 4 GiB — matches config.Load() default
 			},
 			jobProgress: newMockJobProgress(),
 		}
@@ -521,7 +647,7 @@ func TestCreateInDirectory(t *testing.T) {
 			{Path: testFile, Size: 100000},
 		}
 
-		createdFiles, err := executor.CreateInDirectory(context.Background(), files, "")
+		createdFiles, err := all(executor.CreateInDirectory(context.Background(), files, ""))
 		if err != nil {
 			t.Fatalf("CreateInDirectory failed: %v", err)
 		}
@@ -531,7 +657,7 @@ func TestCreateInDirectory(t *testing.T) {
 		}
 
 		// Should be created in configTempDir
-		expectedPar2File := filepath.Join(configTempDir, "testfile.bin.par2")
+		expectedPar2File := filepath.Join(configTempDir, WorkSubdir, "testfile.bin.par2")
 		if _, err := os.Stat(expectedPar2File); os.IsNotExist(err) {
 			t.Fatalf("Expected PAR2 file %s was not created in config temp directory", expectedPar2File)
 		}
@@ -545,9 +671,8 @@ func TestCreateInDirectory(t *testing.T) {
 
 		// Pre-create PAR2 files in output directory
 		mainPar2 := filepath.Join(outputDir, "testfile.bin.par2")
-		volPar2 := filepath.Join(outputDir, "testfile.bin.vol0+1.par2")
-		os.WriteFile(mainPar2, []byte("par2 data"), 0644)
-		os.WriteFile(volPar2, []byte("volume data"), 0644)
+		volPar2 := filepath.Join(outputDir, "testfile.bin.vol00+01.par2")
+		writeRealPar2Files(t, filepath.Dir(mainPar2), testFile, 1)
 
 		executor := &NativeExecutor{
 			articleSize: 10000,
@@ -561,10 +686,14 @@ func TestCreateInDirectory(t *testing.T) {
 			{Path: testFile, Size: 50000},
 		}
 
-		createdFiles, err := executor.CreateInDirectory(context.Background(), files, outputDir)
+		res, err := executor.CreateInDirectory(context.Background(), files, outputDir)
 		if err != nil {
 			t.Fatalf("CreateInDirectory failed: %v", err)
 		}
+		if len(res.Created) != 0 || len(res.Reused) == 0 {
+			t.Fatalf("pre-existing PAR2 must be reported as reused, got Created=%v Reused=%v", res.Created, res.Reused)
+		}
+		createdFiles := res.All()
 
 		if len(createdFiles) < 2 {
 			t.Fatalf("Expected at least 2 existing PAR2 files, got %d", len(createdFiles))
@@ -589,12 +718,81 @@ func TestCreateInDirectory(t *testing.T) {
 		}
 	})
 
-	t.Run("creates nested output directory structure", func(t *testing.T) {
+	t.Run("reuses existing PAR2 files in source dir when TempDir configured and no outputDir", func(t *testing.T) {
+		sourceDir := t.TempDir()
 		tempDir := t.TempDir()
-		testFile := filepath.Join(tempDir, "testfile.bin")
-		createTestFile(t, testFile, 100000)
+		testFile := filepath.Join(sourceDir, "testfile.bin")
+		createTestFile(t, testFile, 50000)
 
-		nestedOutputDir := filepath.Join(tempDir, "output", "nested", "deep")
+		// Pre-create PAR2 files in the SOURCE directory (not TempDir)
+		mainPar2 := filepath.Join(sourceDir, "testfile.bin.par2")
+		volPar2 := filepath.Join(sourceDir, "testfile.bin.vol00+01.par2")
+		writeRealPar2Files(t, filepath.Dir(mainPar2), testFile, 1)
+
+		executor := &NativeExecutor{
+			articleSize: 10000,
+			cfg: &config.Par2Config{
+				Redundancy: "10",
+				TempDir:    tempDir, // TempDir configured but PAR2 exists in source dir
+			},
+			jobProgress: newMockJobProgress(),
+		}
+
+		files := []fileinfo.FileInfo{
+			{Path: testFile, Size: 50000},
+		}
+
+		// Call with empty outputDir — should detect par2 in source dir, not regenerate in TempDir
+		res, err := executor.CreateInDirectory(context.Background(), files, "")
+		if err != nil {
+			t.Fatalf("CreateInDirectory failed: %v", err)
+		}
+		if len(res.Created) != 0 || len(res.Reused) == 0 {
+			t.Fatalf("pre-existing PAR2 must be reported as reused, got Created=%v Reused=%v", res.Created, res.Reused)
+		}
+		createdFiles := res.All()
+
+		if len(createdFiles) < 2 {
+			t.Fatalf("Expected at least 2 existing PAR2 files, got %d", len(createdFiles))
+		}
+
+		foundMain := false
+		foundVol := false
+		for _, f := range createdFiles {
+			if f == mainPar2 {
+				foundMain = true
+			}
+			if f == volPar2 {
+				foundVol = true
+			}
+		}
+		if !foundMain {
+			t.Error("Main PAR2 file from source dir not found in returned paths")
+		}
+		if !foundVol {
+			t.Error("Volume PAR2 file from source dir not found in returned paths")
+		}
+
+		// Verify nothing was created in TempDir
+		entries, err := os.ReadDir(tempDir)
+		if err != nil {
+			t.Fatalf("failed to read temp dir: %v", err)
+		}
+		if len(entries) > 0 {
+			t.Errorf("Expected TempDir to be empty (existing PAR2 found in source), but found %d files", len(entries))
+		}
+	})
+
+	t.Run("reuses existing PAR2 files in source dir when outputDir configured", func(t *testing.T) {
+		sourceDir := t.TempDir()
+		outputDir := t.TempDir()
+		testFile := filepath.Join(sourceDir, "testfile.bin")
+		createTestFile(t, testFile, 50000)
+
+		// Pre-create PAR2 files in the SOURCE directory (not outputDir)
+		mainPar2 := filepath.Join(sourceDir, "testfile.bin.par2")
+		volPar2 := filepath.Join(sourceDir, "testfile.bin.vol00+01.par2")
+		writeRealPar2Files(t, filepath.Dir(mainPar2), testFile, 1)
 
 		executor := &NativeExecutor{
 			articleSize: 10000,
@@ -605,10 +803,74 @@ func TestCreateInDirectory(t *testing.T) {
 		}
 
 		files := []fileinfo.FileInfo{
+			{Path: testFile, Size: 50000},
+		}
+
+		// Call with outputDir — should detect par2 in source dir, not regenerate in outputDir
+		res, err := executor.CreateInDirectory(context.Background(), files, outputDir)
+		if err != nil {
+			t.Fatalf("CreateInDirectory failed: %v", err)
+		}
+		if len(res.Created) != 0 || len(res.Reused) == 0 {
+			t.Fatalf("pre-existing PAR2 must be reported as reused, got Created=%v Reused=%v", res.Created, res.Reused)
+		}
+		createdFiles := res.All()
+
+		if len(createdFiles) < 2 {
+			t.Fatalf("Expected at least 2 existing PAR2 files, got %d", len(createdFiles))
+		}
+
+		foundMain := false
+		foundVol := false
+		for _, f := range createdFiles {
+			if f == mainPar2 {
+				foundMain = true
+			}
+			if f == volPar2 {
+				foundVol = true
+			}
+		}
+		if !foundMain {
+			t.Error("Main PAR2 file from source dir not found in returned paths")
+		}
+		if !foundVol {
+			t.Error("Volume PAR2 file from source dir not found in returned paths")
+		}
+
+		// Verify no new PAR2 was created in outputDir
+		outputEntries, err := os.ReadDir(outputDir)
+		if err != nil {
+			t.Fatalf("failed to read output dir: %v", err)
+		}
+		for _, e := range outputEntries {
+			if strings.HasSuffix(e.Name(), ".par2") {
+				t.Errorf("Unexpected PAR2 file created in outputDir: %s", e.Name())
+			}
+		}
+	})
+
+	t.Run("creates nested output directory structure", func(t *testing.T) {
+		tempDir := t.TempDir()
+		testFile := filepath.Join(tempDir, "testfile.bin")
+		createTestFile(t, testFile, 100000)
+
+		nestedOutputDir := filepath.Join(tempDir, "output", "nested", "deep")
+
+		executor := &NativeExecutor{
+			articleSize: 10000,
+			cfg: &config.Par2Config{
+				Redundancy:  "10",
+				SliceSize:   10 * 1024 * 1024,       // 10 MiB — matches config.Load() default
+				MemoryLimit: 4 * 1024 * 1024 * 1024, // 4 GiB — matches config.Load() default
+			},
+			jobProgress: newMockJobProgress(),
+		}
+
+		files := []fileinfo.FileInfo{
 			{Path: testFile, Size: 100000},
 		}
 
-		createdFiles, err := executor.CreateInDirectory(context.Background(), files, nestedOutputDir)
+		createdFiles, err := all(executor.CreateInDirectory(context.Background(), files, nestedOutputDir))
 		if err != nil {
 			t.Fatalf("CreateInDirectory failed: %v", err)
 		}
@@ -643,7 +905,9 @@ func TestCreateInDirectory(t *testing.T) {
 		executor := &NativeExecutor{
 			articleSize: 10000,
 			cfg: &config.Par2Config{
-				Redundancy: "10",
+				Redundancy:  "10",
+				SliceSize:   10 * 1024 * 1024,       // 10 MiB — matches config.Load() default
+				MemoryLimit: 4 * 1024 * 1024 * 1024, // 4 GiB — matches config.Load() default
 			},
 			jobProgress: newMockJobProgress(),
 		}
@@ -654,7 +918,7 @@ func TestCreateInDirectory(t *testing.T) {
 			{Path: testFile3, Size: 50000},
 		}
 
-		createdFiles, err := executor.CreateInDirectory(context.Background(), files, outputDir)
+		createdFiles, err := all(executor.CreateInDirectory(context.Background(), files, outputDir))
 		if err != nil {
 			t.Fatalf("CreateInDirectory failed: %v", err)
 		}
@@ -675,13 +939,7 @@ func TestCreateInDirectory(t *testing.T) {
 				t.Fatalf("Expected PAR2 file %s was not created", expectedFile)
 			}
 
-			found := false
-			for _, createdFile := range createdFiles {
-				if createdFile == expectedFile {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(createdFiles, expectedFile)
 			if !found {
 				t.Fatalf("Expected PAR2 file %s not found in created files list", expectedFile)
 			}
@@ -694,21 +952,24 @@ func TestCheckExistingPar2FilesInDir(t *testing.T) {
 		ctx := context.Background()
 		tempDir := t.TempDir()
 
+		sourceDir := filepath.Join(tempDir, "source")
+		if err := os.MkdirAll(sourceDir, 0755); err != nil {
+			t.Fatal(err)
+		}
 		sourceFile := fileinfo.FileInfo{
-			Path: filepath.Join(tempDir, "source", "testfile.bin"),
+			Path: filepath.Join(sourceDir, "testfile.bin"),
 			Size: 1024 * 1024,
 		}
+		createTestFile(t, sourceFile.Path, 1024*1024)
 
-		// Create PAR2 files in directory
-		mainPar2 := filepath.Join(tempDir, "testfile.bin.par2")
-		vol1 := filepath.Join(tempDir, "testfile.bin.vol0+1.par2")
-		vol2 := filepath.Join(tempDir, "testfile.bin.vol1+2.par2")
-		vol3 := filepath.Join(tempDir, "testfile.bin.vol3+4.par2")
-
-		os.WriteFile(mainPar2, []byte("par2 data"), 0644)
-		os.WriteFile(vol1, []byte("volume 1 data"), 0644)
-		os.WriteFile(vol2, []byte("volume 2 data"), 0644)
-		os.WriteFile(vol3, []byte("volume 3 data"), 0644)
+		// Create a real PAR2 set in directory with several recovery volumes.
+		mainPar2 := writeRealPar2Files(t, tempDir, sourceFile.Path, 7)
+		volumes, err := filepath.Glob(filepath.Join(tempDir, "testfile.bin.vol*.par2"))
+		if err != nil || len(volumes) < 2 {
+			t.Fatalf("expected several volume files, got %v (err=%v)", volumes, err)
+		}
+		want := append([]string{mainPar2}, volumes...)
+		slices.Sort(want)
 
 		executor := &NativeExecutor{
 			articleSize: 512 * 1024,
@@ -723,40 +984,9 @@ func TestCheckExistingPar2FilesInDir(t *testing.T) {
 		if !exists {
 			t.Fatal("Expected existing PAR2 files to be detected")
 		}
-
-		if len(paths) != 4 {
-			t.Fatalf("Expected 4 PAR2 files (1 main + 3 volumes), got %d", len(paths))
-		}
-
-		foundMain := false
-		foundVol1 := false
-		foundVol2 := false
-		foundVol3 := false
-
-		for _, path := range paths {
-			switch path {
-			case mainPar2:
-				foundMain = true
-			case vol1:
-				foundVol1 = true
-			case vol2:
-				foundVol2 = true
-			case vol3:
-				foundVol3 = true
-			}
-		}
-
-		if !foundMain {
-			t.Error("Main PAR2 file not found in returned paths")
-		}
-		if !foundVol1 {
-			t.Error("Volume 1 file not found in returned paths")
-		}
-		if !foundVol2 {
-			t.Error("Volume 2 file not found in returned paths")
-		}
-		if !foundVol3 {
-			t.Error("Volume 3 file not found in returned paths")
+		slices.Sort(paths)
+		if !slices.Equal(paths, want) {
+			t.Fatalf("paths = %v, want %v", paths, want)
 		}
 	})
 

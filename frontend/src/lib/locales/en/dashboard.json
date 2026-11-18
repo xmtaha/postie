@@ -8,15 +8,20 @@
 			"description": "Manage your file uploads and monitor progress",
 			"add_files": "Add Files",
 			"add_folder": "Add Folder",
-			"add_folder_tooltip": "Upload an entire folder as a single NZB",
+			"add_folder_tooltip": "Upload one or more folders, each as a single NZB",
 			"folder_added": "Folder Added",
 			"folder_added_description": "Folder has been added to the upload queue",
+			"folders_added": "Folders Added",
+			"folders_added_description": "{{count}} folders have been added to the upload queue",
 			"import_files": "Import Files",
 			"import_files_tooltip": "Browse and import files from the remote server",
 			"clear_completed": "Clear Completed"
 		},
 		"queue": {
+			"reused_nzb": "Reused NZB",
 			"title": "Upload Queue",
+			"search_placeholder": "Search filename…",
+			"search_within_page": "current page only",
 			"items": "items",
 			"total_size": "Total Size",
 			"nzb": "NZB",
@@ -51,6 +56,9 @@
 			"next": "Next",
 			"retry_all_failed": "Retry Failed",
 			"bulk_retry_success": "Successfully retried {count} items",
+			"delete_selected": "Delete Selected ({count})",
+			"confirm_delete_selected": "Are you sure you want to delete {count} selected items? This cannot be undone.",
+			"batch_deleted": "{count} items removed from the queue.",
 			"status_types": {
 				"pending": "pending",
 				"complete": "complete",
@@ -59,10 +67,19 @@
 				"processing": "Processing",
 				"completed": "Completed",
 				"failed": "Failed"
-			}
+			},
+			"verification": {
+				"pending": "Verifying",
+				"failed": "Verify Failed",
+				"progress": "{verified} of {total} verified"
+			},
+			"duration": "Duration",
+			"processing_time": "Processing time"
 		},
 		"progress": {
 			"title": "Upload Progress",
+			"file_size": "File Size",
+			"path": "Path",
 			"status": {
 				"active": "Active",
 				"idle": "Idle",
@@ -71,7 +88,8 @@
 			"task_status": {
 				"paused": "Paused",
 				"in_progress": "In Progress",
-				"pending": "Pending"
+				"pending": "Pending",
+				"waiting": "Waiting for propagation..."
 			},
 			"pause_processing": "Pause Processing",
 			"resume_processing": "Resume Processing",
@@ -118,6 +136,10 @@
 				"successfully_finished": "Successfully finished",
 				"errors_detected": "Errors Detected",
 				"failed_to_process": "Items that failed to process",
+				"pending_verification": "Pending Verification",
+				"pending_verification_hint": "Uploaded; awaiting background verification",
+				"verification_failed": "Verification Failed",
+				"verification_failed_hint": "Some articles could not be verified; originals retained",
 				"failed_items": "Failed items",
 				"queue_progress": "Queue Progress",
 				"overall_completion": "Overall completion status",
@@ -136,6 +158,7 @@
 		"job_failed": "Upload failed: {fileName}",
 		"file_explorer": {
 			"title": "Add Files from Server to Queue",
+			"close": "Close",
 			"import_success": "Files added to queue successfully",
 			"no_files_selected": "No files selected",
 			"import_success_description": "Successfully added {count} {count, plural, =1 {file} other {files}} to queue",
@@ -161,21 +184,29 @@
 			"error": "Error loading provider status",
 			"anonymous": "Anonymous",
 			"connections": "Connections",
-			"success_rate": "Success Rate",
-			"uploaded": "Uploaded",
-			"articles": "Articles",
-			"idle_connections": "Idle",
+			"avg_speed": "Avg Speed",
+			"missing": "Missing",
+			"errors": "Errors",
+			"elapsed": "Uptime",
 			"pool_summary": "Pool Summary",
 			"active_connections": "active connections",
-			"total_uploaded": "Total Uploaded",
+			"total_errors": "Total Errors",
 			"no_providers": "No providers configured",
+			"inflight": "Pipeline depth",
+			"current_speed": "Current Speed",
+			"ttfb": "TTFB",
+			"downloaded": "Downloaded",
+			"uploaded": "Uploaded",
+			"upload_speed": "Upload Speed",
+			"avg_upload_speed": "Avg Upload Speed",
+			"free_slots": "free",
+			"quota": "Quota",
+			"quota_exceeded": "Exceeded",
+			"quota_resets": "Resets",
 			"status": {
 				"connected": "Connected",
-				"connecting": "Connecting",
-				"reconnecting": "Reconnecting",
-				"failed": "Failed",
-				"disconnected": "Disconnected",
-				"unknown": "Unknown"
+				"idle": "Idle",
+				"failed": "Failed"
 			}
 		},
 		"watcher": {
@@ -192,7 +223,12 @@
 			"next_run_soon": "Soon",
 			"next_run_minutes": "in {count} {count, plural, =1 {minute} other {minutes}}",
 			"next_run_hours": "in {count} {count, plural, =1 {hour} other {hours}}",
-			"next_run_days": "in {count} {count, plural, =1 {day} other {days}}"
+			"next_run_days": "in {count} {count, plural, =1 {day} other {days}}",
+			"scan_now": "Scan Now",
+			"scan_triggered": "Scan Triggered",
+			"scan_triggered_description": "Directory scan has been started",
+			"watcher_number": "Watcher #{n}",
+			"no_watchers": "No watch directories configured"
 		}
 	}
 }

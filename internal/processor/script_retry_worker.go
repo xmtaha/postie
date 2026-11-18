@@ -10,17 +10,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/javi11/postie/internal/config"
-	"github.com/javi11/postie/internal/queue"
+	"github.com/kipsilabs/postie/internal/config"
+	"github.com/kipsilabs/postie/internal/queue"
 )
 
 // ScriptRetryWorker handles retrying failed post-upload script executions
 type ScriptRetryWorker struct {
-	queue               *queue.Queue
-	scriptConfig        config.PostUploadScriptConfig
-	ctx                 context.Context
-	cancel              context.CancelFunc
-	retryCheckInterval  time.Duration
+	queue              *queue.Queue
+	scriptConfig       config.PostUploadScriptConfig
+	ctx                context.Context
+	cancel             context.CancelFunc
+	retryCheckInterval time.Duration
 }
 
 // NewScriptRetryWorker creates a new script retry worker

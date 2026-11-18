@@ -13,8 +13,8 @@ import (
 	context "context"
 	reflect "reflect"
 
-	nntppool "github.com/javi11/nntppool/v2"
-	config "github.com/javi11/postie/internal/config"
+	nntppool "github.com/javi11/nntppool/v4"
+	config "github.com/kipsilabs/postie/internal/config"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -71,10 +71,10 @@ func (mr *MockConfigMockRecorder) GetMaintainOriginalExtension() *gomock.Call {
 }
 
 // GetNNTPPool mocks base method.
-func (m *MockConfig) GetNNTPPool() (nntppool.UsenetConnectionPool, error) {
+func (m *MockConfig) GetNNTPPool() (*nntppool.Client, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetNNTPPool")
-	ret0, _ := ret[0].(nntppool.UsenetConnectionPool)
+	ret0, _ := ret[0].(*nntppool.Client)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
@@ -170,6 +170,20 @@ func (mr *MockConfigMockRecorder) GetQueueConfig() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetQueueConfig", reflect.TypeOf((*MockConfig)(nil).GetQueueConfig))
 }
 
+// GetAPIConfig mocks base method.
+func (m *MockConfig) GetAPIConfig() config.APIConfig {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetAPIConfig")
+	ret0, _ := ret[0].(config.APIConfig)
+	return ret0
+}
+
+// GetAPIConfig indicates an expected call of GetAPIConfig.
+func (mr *MockConfigMockRecorder) GetAPIConfig() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAPIConfig", reflect.TypeOf((*MockConfig)(nil).GetAPIConfig))
+}
+
 // GetWatcherConfig mocks base method.
 func (m *MockConfig) GetWatcherConfig() config.WatcherConfig {
 	m.ctrl.T.Helper()
@@ -182,4 +196,18 @@ func (m *MockConfig) GetWatcherConfig() config.WatcherConfig {
 func (mr *MockConfigMockRecorder) GetWatcherConfig() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetWatcherConfig", reflect.TypeOf((*MockConfig)(nil).GetWatcherConfig))
+}
+
+// GetWatcherConfigs mocks base method.
+func (m *MockConfig) GetWatcherConfigs() []config.WatcherConfig {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetWatcherConfigs")
+	ret0, _ := ret[0].([]config.WatcherConfig)
+	return ret0
+}
+
+// GetWatcherConfigs indicates an expected call of GetWatcherConfigs.
+func (mr *MockConfigMockRecorder) GetWatcherConfigs() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetWatcherConfigs", reflect.TypeOf((*MockConfig)(nil).GetWatcherConfigs))
 }

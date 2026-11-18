@@ -1,12 +1,31 @@
 {
 	"common": {
+		"auth": {
+			"retry": "Yeniden dene",
+			"signIn": "Postie’ye giriş yap",
+			"createAdmin": "Yönetici hesabı oluştur",
+			"signOut": "Çıkış yap",
+			"username": "Kullanıcı adı veya e-posta",
+			"email": "E-posta (isteğe bağlı)",
+			"password": "Şifre",
+			"bootstrapDescription": "İlk yönetici hesabını oluşturun. Bu hesap oluşturulduktan sonra kayıt kapanır.",
+			"passwordHint": "12–72 bayt uzunluğunda bir şifre kullanın.",
+			"invalidCredentials": "Kullanıcı adı veya şifre geçersiz.",
+			"registrationError": "Kayıt yapılamadı. Bilgileri kontrol edin veya mevcut hesapla giriş yapın.",
+			"connectionError": "Sunucuya bağlanılamıyor. Yeniden denemek için sayfayı yenileyin.",
+			"tooManyAttempts": "Çok fazla deneme. Bir dakika bekleyin.",
+			"logoutError": "Çıkış yapılamadı."
+		},
 		"nav": {
 			"dashboard": "Panel",
 			"settings": "Ayarlar",
 			"metrics": "Metrikler",
 			"logs": "Günlükler",
 			"language": "Dil",
-			"theme": "Tema"
+			"theme": "Tema",
+			"menu": "Menüyü aç",
+			"closeMenu": "Menüyü kapat",
+			"primary": "Ana gezinme"
 		},
 		"actions": {
 			"save": "Kaydet",
@@ -87,7 +106,18 @@
 			"item_cancelled": "Öğe iptal edildi",
 			"failed_to_cancel_item": "Öğe iptal edilemedi"
 		},
-		"app_name": "Postie"
+		"app_name": "Postie",
+		"appearance": {
+			"label": "Görünüm",
+			"system": "Sistem",
+			"light": "Açık",
+			"dark": "Koyu"
+		},
+		"connection": {
+			"connected": "Bağlı",
+			"reconnecting": "Yeniden bağlanıyor…",
+			"disconnected": "Bağlantı kesildi"
+		}
 	},
 	"logs": {
 		"download": "İndir",

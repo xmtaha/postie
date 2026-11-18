@@ -5,34 +5,30 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
+	"github.com/go-pkgz/auth/v2/token"
 	"github.com/gorilla/mux"
-	"github.com/gorilla/websocket"
-	"github.com/javi11/postie/frontend"
-	"github.com/javi11/postie/internal/backend"
-	"github.com/javi11/postie/internal/config"
+	"github.com/kipsilabs/postie/frontend"
+	"github.com/kipsilabs/postie/internal/backend"
+	"github.com/kipsilabs/postie/internal/config"
+	"github.com/kipsilabs/postie/internal/database"
+	"github.com/kipsilabs/postie/internal/webauth"
+	"github.com/kipsilabs/postie/internal/wshub"
 	"github.com/spf13/cobra"
 )
 
 // For development, serve static files from disk
 // In production, these would be embedded
 var frontendBuildPath = "../../frontend/build"
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for now, should be configured properly
-	},
-}
 
 // ErrorResponse represents a structured error response
 type ErrorResponse struct {
@@ -55,143 +51,28 @@ const (
 )
 
 var (
-	port string
-	host string
+	port        string
+	host        string
+	authEnabled bool
 )
 
-// WebSocketClient represents a connected WebSocket client
-type WebSocketClient struct {
-	conn *websocket.Conn
-	send chan []byte
-	hub  *WebSocketHub
-	id   string
-}
-
-// WebSocketHub manages WebSocket connections and broadcasts
-type WebSocketHub struct {
-	clients    map[*WebSocketClient]bool
-	broadcast  chan []byte
-	register   chan *WebSocketClient
-	unregister chan *WebSocketClient
-	mu         sync.RWMutex
-}
-
-// WebSocketMessage represents a message sent over WebSocket
-type WebSocketMessage struct {
-	Type string      `json:"type"`
-	Data interface{} `json:"data"`
-}
-
-// NewWebSocketHub creates a new WebSocket hub
-func NewWebSocketHub() *WebSocketHub {
-	return &WebSocketHub{
-		clients:    make(map[*WebSocketClient]bool),
-		broadcast:  make(chan []byte, 256),
-		register:   make(chan *WebSocketClient),
-		unregister: make(chan *WebSocketClient),
-	}
-}
-
-// Run starts the WebSocket hub
-func (h *WebSocketHub) Run() {
-	for {
-		select {
-		case client := <-h.register:
-			h.mu.Lock()
-			h.clients[client] = true
-			h.mu.Unlock()
-			log.Printf("WebSocket client connected: %s", client.id)
-
-		case client := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
-				log.Printf("WebSocket client disconnected: %s", client.id)
-			}
-			h.mu.Unlock()
-
-		case message := <-h.broadcast:
-			h.mu.RLock()
-			for client := range h.clients {
-				select {
-				case client.send <- message:
-				default:
-					delete(h.clients, client)
-					close(client.send)
-				}
-			}
-			h.mu.RUnlock()
-		}
-	}
-}
-
-// EmitEvent sends an event to all connected clients
-func (h *WebSocketHub) EmitEvent(eventType string, data interface{}) {
-	message := WebSocketMessage{
-		Type: eventType,
-		Data: data,
-	}
-
-	jsonData, err := json.Marshal(message)
-	if err != nil {
-		log.Printf("Error marshaling WebSocket message: %v", err)
-		return
-	}
-
-	select {
-	case h.broadcast <- jsonData:
-	default:
-		log.Printf("WebSocket broadcast channel full, dropping message")
-	}
-}
-
-// readPump handles reading from the WebSocket connection
-func (c *WebSocketClient) readPump() {
-	defer func() {
-		c.hub.unregister <- c
-		_ = c.conn.Close()
-	}()
-
-	for {
-		_, _, err := c.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WebSocket error: %v", err)
-			}
-			break
-		}
-	}
-}
-
-// writePump handles writing to the WebSocket connection
-func (c *WebSocketClient) writePump() {
-	defer func() {
-		_ = c.conn.Close()
-	}()
-
-	for message := range c.send {
-		if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-			log.Printf("WebSocket write error: %v", err)
-			return
-		}
-	}
-}
-
 // WebEventEmitter is a function that emits events for web mode
-type WebEventEmitter func(eventType string, data interface{})
+type WebEventEmitter func(eventType string, data any)
 
 type WebServer struct {
 	app          *backend.App
 	router       *mux.Router
-	wsHub        *WebSocketHub
+	wsHub        *wshub.Hub
 	eventEmitter WebEventEmitter
+	authRequired bool
+	auth         *webauth.Service
+	authLimiter  authLimiter
 }
 
 func NewWebServer() *WebServer {
 	app := backend.NewApp()
 	router := mux.NewRouter()
-	wsHub := NewWebSocketHub()
+	wsHub := wshub.NewHub()
 
 	ws := &WebServer{
 		app:    app,
@@ -200,7 +81,7 @@ func NewWebServer() *WebServer {
 	}
 
 	// Create event emitter function
-	ws.eventEmitter = func(eventType string, data interface{}) {
+	ws.eventEmitter = func(eventType string, data any) {
 		ws.wsHub.EmitEvent(eventType, data)
 	}
 
@@ -217,30 +98,28 @@ func NewWebServer() *WebServer {
 }
 
 func (ws *WebServer) setupRoutes() {
-	// Request logging middleware
-	ws.router.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// CORS headers
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-
-			next.ServeHTTP(w, r)
-		})
-	})
+	ws.router.Use(ws.authMiddleware)
 
 	ws.router.HandleFunc("/live", ws.LiveHandler).Methods("GET")
 
 	// API routes - register WebSocket first with explicit path
 	ws.router.HandleFunc("/api/ws", ws.handleWebSocket)
 
+	// Gated external API: only mount when api.enabled = true and protected by
+	// the X-API-Key / Bearer token middleware.
+	v1 := ws.router.PathPrefix("/api/v1").Subrouter()
+	v1.Use(ws.apiKeyMiddleware)
+	v1.HandleFunc("/queue/upload", ws.handleAPIQueueUpload).Methods("POST")
+
 	// API routes
 	api := ws.router.PathPrefix("/api").Subrouter()
+
+	// Public bootstrap/login and authenticated session routes.
+	api.HandleFunc("/auth/registration-status", ws.handleRegistrationStatus).Methods("GET")
+	api.HandleFunc("/auth/login", ws.handleLogin).Methods("POST")
+	api.HandleFunc("/auth/register", ws.handleRegister).Methods("POST")
+	api.HandleFunc("/auth/user", ws.handleUser).Methods("GET")
+	api.HandleFunc("/auth/logout", ws.handleLogout).Methods("POST")
 
 	// REST API endpoints
 	api.HandleFunc("/status", ws.handleGetStatus).Methods("GET")
@@ -275,9 +154,23 @@ func (ws *WebServer) setupRoutes() {
 	api.HandleFunc("/validate-server", ws.handleValidateServer).Methods("POST")
 	api.HandleFunc("/setup/complete", ws.handleSetupComplete).Methods("POST")
 	api.HandleFunc("/metrics/nntp-pool", ws.handleGetNntpPoolMetrics).Methods("GET")
+	api.HandleFunc("/metrics/transfer-runtime", ws.handleGetTransferRuntimeMetrics).Methods("GET")
 	api.HandleFunc("/filesystem/browse", ws.handleBrowseFilesystem).Methods("GET")
 	api.HandleFunc("/filesystem/import", ws.handleImportFiles).Methods("POST")
 	api.HandleFunc("/watcher/status", ws.handleGetWatcherStatus).Methods("GET")
+	api.HandleFunc("/watcher/scan", ws.handleTriggerScan).Methods("POST")
+
+	// Arr webhook integration (web mode only — hidden in desktop UI)
+	api.HandleFunc("/arr/instances", ws.handleListArrInstances).Methods("GET")
+	api.HandleFunc("/arr/instances", ws.handleAddArrInstance).Methods("POST")
+	api.HandleFunc("/arr/instances/{id}", ws.handleRemoveArrInstance).Methods("DELETE")
+	api.HandleFunc("/arr/instances/{id}/test", ws.handleTestArrConnection).Methods("POST")
+	// Webhook receiver — API key validated from ?apiKey query param (arr can't send custom headers)
+	api.HandleFunc("/arr/webhook/{instanceId}", ws.handleArrWebhook).Methods("POST")
+
+	// API key management for the authenticated settings UI
+	api.HandleFunc("/api-key", ws.handleGetAPIKey).Methods("GET")
+	api.HandleFunc("/api-key/regenerate", ws.handleRegenerateAPIKey).Methods("POST")
 
 	// Serve static files (catch-all)
 	ws.router.PathPrefix("/").Handler(ws.getStaticFileHandler())
@@ -294,7 +187,7 @@ func (ws *WebServer) getStaticFileHandler() http.Handler {
 		// Production mode - serve from embedded filesystem
 		buildFS, err := frontend.GetBuildFS()
 		if err != nil {
-			log.Printf("Failed to get embedded filesystem: %v", err)
+			slog.Warn("Failed to get embedded filesystem, using disk fallback", "error", err)
 			fs = http.Dir(frontendBuildPath)
 		} else {
 			fs = http.FS(buildFS)
@@ -344,7 +237,7 @@ func (ws *WebServer) LiveHandler(w http.ResponseWriter, r *http.Request) {
 	response := map[string]string{"status": "live"}
 
 	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.Printf("Error encoding live response: %v", err)
+		slog.Error("Error encoding live response", "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
@@ -356,29 +249,28 @@ func (ws *WebServer) handleGetWatcherStatus(w http.ResponseWriter, r *http.Reque
 	_ = json.NewEncoder(w).Encode(status)
 }
 
+func (ws *WebServer) handleTriggerScan(w http.ResponseWriter, r *http.Request) {
+	ws.app.TriggerScan()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
 func (ws *WebServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("WebSocket upgrade error: %v", err)
+	claims, authenticated := r.Context().Value(sessionContextKey{}).(*token.Claims)
+	if !authenticated {
+		ws.wsHub.ServeHTTP(w, r)
 		return
 	}
-
-	log.Printf("WebSocket connection established successfully")
-
-	// Create client
-	client := &WebSocketClient{
-		conn: conn,
-		send: make(chan []byte, 256),
-		hub:  ws.wsHub,
-		id:   fmt.Sprintf("client-%s", conn.RemoteAddr().String()),
+	ws.wsHub.ServeSessionHTTP(w, r, claims.ID, claims.ExpiresAt.Time)
+	// A logout may race the upgrade/registration. Re-check after the hub has
+	// registered this connection so that a revoked session cannot remain open.
+	cookie, err := r.Cookie(sessionCookie)
+	if err == nil {
+		_, err = ws.auth.Validate(context.Background(), cookie.Value)
 	}
-
-	// Register client
-	ws.wsHub.register <- client
-
-	// Start client pumps
-	go client.writePump()
-	go client.readPump()
+	if err != nil {
+		ws.wsHub.DisconnectSession(claims.ID)
+	}
 }
 
 func (ws *WebServer) handleGetStatus(w http.ResponseWriter, r *http.Request) {
@@ -400,6 +292,11 @@ func (ws *WebServer) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 func (ws *WebServer) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 	var configData config.ConfigData
 	if err := json.NewDecoder(r.Body).Decode(&configData); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := configData.Validate(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -436,18 +333,24 @@ func (ws *WebServer) handleGetQueueItems(w http.ResponseWriter, r *http.Request)
 		order = "desc" // Default sort order
 	}
 
+	status := query.Get("status")
+	if status != "" && status != "pending" && status != "complete" && status != "error" && status != "running" {
+		status = ""
+	}
+
 	// Create pagination parameters
 	params := backend.PaginationParams{
 		Page:   page,
 		Limit:  limit,
 		SortBy: sortBy,
 		Order:  order,
+		Status: status,
 	}
 
 	// Get paginated results
 	result, err := ws.app.GetQueueItems(params)
 	if err != nil {
-		log.Printf("Failed to get paginated queue items: %v", err)
+		slog.Error("Failed to get paginated queue items", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -569,10 +472,10 @@ func (ws *WebServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Processing %d uploaded files", len(files))
+	slog.Info("Processing uploaded files", "count", len(files))
 
 	// Emit initial upload progress
-	ws.wsHub.EmitEvent("upload-progress", map[string]interface{}{
+	ws.wsHub.EmitEvent("upload-progress", map[string]any{
 		"stage":     "saving",
 		"progress":  0,
 		"fileCount": len(files),
@@ -618,7 +521,7 @@ func (ws *WebServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 		// Emit progress for file saving
 		progress := float64(i+1) / float64(len(files)) * 50 // 50% for saving files
-		ws.wsHub.EmitEvent("upload-progress", map[string]interface{}{
+		ws.wsHub.EmitEvent("upload-progress", map[string]any{
 			"stage":       "saving",
 			"progress":    progress,
 			"currentFile": fileHeader.Filename,
@@ -627,7 +530,7 @@ func (ws *WebServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Emit progress for processing stage
-	ws.wsHub.EmitEvent("upload-progress", map[string]interface{}{
+	ws.wsHub.EmitEvent("upload-progress", map[string]any{
 		"stage":     "processing",
 		"progress":  75,
 		"fileCount": len(files),
@@ -640,7 +543,7 @@ func (ws *WebServer) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Emit completion
-	ws.wsHub.EmitEvent("upload-complete", map[string]interface{}{
+	ws.wsHub.EmitEvent("upload-complete", map[string]any{
 		"fileCount": len(files),
 		"message":   "Files successfully processed and added to queue",
 	})
@@ -676,10 +579,10 @@ func (ws *WebServer) handleUploadFolder(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	log.Printf("Processing folder upload: %s with %d files", folderName, len(files))
+	slog.Info("Processing folder upload", "folder", folderName, "count", len(files))
 
 	// Emit initial upload progress
-	ws.wsHub.EmitEvent("upload-progress", map[string]interface{}{
+	ws.wsHub.EmitEvent("upload-progress", map[string]any{
 		"stage":      "saving",
 		"progress":   0,
 		"fileCount":  len(files),
@@ -734,7 +637,7 @@ func (ws *WebServer) handleUploadFolder(w http.ResponseWriter, r *http.Request) 
 
 		// Emit progress for file saving
 		progress := float64(i+1) / float64(len(files)) * 50 // 50% for saving files
-		ws.wsHub.EmitEvent("upload-progress", map[string]interface{}{
+		ws.wsHub.EmitEvent("upload-progress", map[string]any{
 			"stage":       "saving",
 			"progress":    progress,
 			"currentFile": fileHeader.Filename,
@@ -744,7 +647,7 @@ func (ws *WebServer) handleUploadFolder(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Emit progress for processing stage
-	ws.wsHub.EmitEvent("upload-progress", map[string]interface{}{
+	ws.wsHub.EmitEvent("upload-progress", map[string]any{
 		"stage":      "processing",
 		"progress":   75,
 		"fileCount":  len(files),
@@ -760,7 +663,7 @@ func (ws *WebServer) handleUploadFolder(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Emit completion
-	ws.wsHub.EmitEvent("upload-complete", map[string]interface{}{
+	ws.wsHub.EmitEvent("upload-complete", map[string]any{
 		"fileCount":  len(files),
 		"folderName": folderName,
 		"message":    "Folder successfully processed and added to queue as single NZB",
@@ -958,22 +861,21 @@ func (ws *WebServer) categorizeSetupError(err error) (SetupErrorCode, string, st
 }
 
 func (ws *WebServer) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Setup completion requested from %s", r.RemoteAddr)
+	slog.Info("Setup completion requested", "addr", r.RemoteAddr)
 
 	var wizardData backend.SetupWizardData
 	if err := json.NewDecoder(r.Body).Decode(&wizardData); err != nil {
-		log.Printf("Setup completion failed - invalid JSON: %v", err)
+		slog.Error("Setup completion failed - invalid JSON", "error", err)
 		ws.sendErrorResponse(w, http.StatusBadRequest, SetupErrorInvalidInput,
 			"Invalid request data",
 			"The request body contains invalid JSON. Please ensure all required fields are properly formatted.")
 		return
 	}
 
-	log.Printf("Processing setup wizard data: %d servers, output dir: %s",
-		len(wizardData.Servers), wizardData.OutputDirectory)
+	slog.Info("Processing setup wizard data", "servers", len(wizardData.Servers), "output_dir", wizardData.OutputDirectory)
 
 	if err := ws.app.SetupWizardComplete(wizardData); err != nil {
-		log.Printf("Setup wizard completion failed: %v", err)
+		slog.Error("Setup wizard completion failed", "error", err)
 
 		// Categorize the error and provide appropriate response
 		errorCode, message, details := ws.categorizeSetupError(err)
@@ -988,10 +890,10 @@ func (ws *WebServer) handleSetupComplete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	log.Printf("Setup wizard completed successfully")
+	slog.Info("Setup wizard completed successfully")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"success":   true,
 		"message":   "Setup completed successfully",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
@@ -1045,6 +947,11 @@ func (ws *WebServer) handleGetNntpPoolMetrics(w http.ResponseWriter, r *http.Req
 	_ = json.NewEncoder(w).Encode(metrics)
 }
 
+func (ws *WebServer) handleGetTransferRuntimeMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(ws.app.GetTransferRuntimeMetrics())
+}
+
 // FileSystemItem represents a file or directory in the filesystem
 type FileSystemItem struct {
 	Name     string           `json:"name"`
@@ -1072,13 +979,13 @@ func (ws *WebServer) handleBrowseFilesystem(w http.ResponseWriter, r *http.Reque
 
 	items, err := ws.browseDirectory(targetPath)
 	if err != nil {
-		log.Printf("Error browsing directory %s: %v", targetPath, err)
+		slog.Error("Error browsing directory", "path", targetPath, "error", err)
 		http.Error(w, fmt.Sprintf("Failed to browse directory: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"path":  targetPath,
 		"items": items,
 	})
@@ -1127,10 +1034,10 @@ func (ws *WebServer) handleImportFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Importing %d files from remote filesystem", len(requestBody.FilePaths))
+	slog.Info("Importing files from remote filesystem", "count", len(requestBody.FilePaths))
 
 	// Emit initial import progress
-	ws.wsHub.EmitEvent("import-progress", map[string]interface{}{
+	ws.wsHub.EmitEvent("import-progress", map[string]any{
 		"stage":     "validating",
 		"progress":  0,
 		"fileCount": len(requestBody.FilePaths),
@@ -1142,14 +1049,14 @@ func (ws *WebServer) handleImportFiles(w http.ResponseWriter, r *http.Request) {
 		// Security: Clean the path and validate
 		cleanPath := filepath.Clean(filePath)
 		if !filepath.IsAbs(cleanPath) {
-			log.Printf("Skipping relative path: %s", filePath)
+			slog.Warn("Skipping relative path", "path", filePath)
 			continue
 		}
 
 		// Check if path exists and is readable
 		info, err := os.Stat(cleanPath)
 		if err != nil {
-			log.Printf("Skipping inaccessible path: %s (%v)", filePath, err)
+			slog.Warn("Skipping inaccessible path", "path", filePath, "error", err)
 			continue
 		}
 
@@ -1163,7 +1070,7 @@ func (ws *WebServer) handleImportFiles(w http.ResponseWriter, r *http.Request) {
 
 		// Emit validation progress
 		progress := float64(i+1) / float64(len(requestBody.FilePaths)) * 50 // 50% for validation
-		ws.wsHub.EmitEvent("import-progress", map[string]interface{}{
+		ws.wsHub.EmitEvent("import-progress", map[string]any{
 			"stage":       "validating",
 			"progress":    progress,
 			"currentFile": filepath.Base(filePath),
@@ -1178,7 +1085,7 @@ func (ws *WebServer) handleImportFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Emit processing stage
-	ws.wsHub.EmitEvent("import-progress", map[string]interface{}{
+	ws.wsHub.EmitEvent("import-progress", map[string]any{
 		"stage":     "processing",
 		"progress":  75,
 		"fileCount": len(validFiles),
@@ -1192,13 +1099,13 @@ func (ws *WebServer) handleImportFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Emit completion
-	ws.wsHub.EmitEvent("import-complete", map[string]interface{}{
+	ws.wsHub.EmitEvent("import-complete", map[string]any{
 		"fileCount": len(validFiles),
 		"message":   fmt.Sprintf("Successfully imported %d files from remote filesystem", len(validFiles)),
 	})
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"success":       true,
 		"importedCount": len(validFiles),
 		"message":       fmt.Sprintf("Successfully imported %d files", len(validFiles)),
@@ -1215,14 +1122,45 @@ var rootCmd = &cobra.Command{
 	Long: `Postie Web Server provides a web interface for uploading files.
 It serves the frontend application and provides REST API endpoints for managing uploads and configuration.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Invalid environment values must fail startup rather than disable protection.
+		if value, exists := os.LookupEnv("POSTIE_AUTH_ENABLED"); exists && !cmd.Flags().Changed("auth") {
+			var err error
+			authEnabled, err = strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("POSTIE_AUTH_ENABLED: %w", err)
+			}
+		}
 		server := NewWebServer()
+		server.authRequired = authEnabled
 
 		// Initialize the app
 		ctx := context.Background()
 		server.app.Startup(ctx)
+		// Authentication must work before NNTP setup and outlive posting queue
+		// restarts. Own a separate connection to the same application database.
+		defer server.app.Shutdown()
+		if server.authRequired {
+			paths, err := backend.GetAppPaths()
+			if err != nil {
+				return fmt.Errorf("authentication paths: %w", err)
+			}
+			authDB, err := database.New(ctx, config.DatabaseConfig{DatabaseType: "sqlite", DatabasePath: paths.Database})
+			if err != nil {
+				return fmt.Errorf("authentication database: %w", err)
+			}
+			defer func() { _ = authDB.Close() }()
+			if err = authDB.EnsureMigrationCompatibility(); err != nil {
+				return fmt.Errorf("authentication migrations: %w", err)
+			}
+			authService, err := webauth.New(authDB.DB)
+			if err != nil {
+				return fmt.Errorf("initialize web authentication: %w", err)
+			}
+			server.auth = authService
+		}
 
 		addr := fmt.Sprintf("%s:%s", host, port)
-		log.Printf("Starting web server on %s", addr)
+		slog.Info("Web server started", "addr", addr)
 
 		// Create HTTP server
 		httpServer := &http.Server{
@@ -1247,10 +1185,9 @@ It serves the frontend application and provides REST API endpoints for managing 
 		case err := <-serverErrChan:
 			return err
 		case <-sigChan:
-			log.Println("Received interrupt signal, shutting down gracefully...")
+			slog.Info("Received interrupt signal, shutting down gracefully")
 
-			// Shutdown the app first
-			server.app.Shutdown()
+			// App and authentication database are closed by deferred cleanup.
 
 			// Create a timeout context for server shutdown
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1258,17 +1195,18 @@ It serves the frontend application and provides REST API endpoints for managing 
 
 			// Shutdown HTTP server
 			if err := httpServer.Shutdown(shutdownCtx); err != nil {
-				log.Printf("Server shutdown error: %v", err)
+				slog.Error("Server shutdown error", "error", err)
 				return err
 			}
 
-			log.Println("Server shut down successfully")
+			slog.Info("Server shut down successfully")
 			return nil
 		}
 	},
 }
 
 func init() {
+	rootCmd.PersistentFlags().BoolVar(&authEnabled, "auth", false, "Require web administrator login (or set POSTIE_AUTH_ENABLED=true)")
 	rootCmd.PersistentFlags().StringVarP(&port, "port", "p", "8080", "Port to run the web server on")
 	rootCmd.PersistentFlags().StringVar(&host, "host", "0.0.0.0", "Host address to bind the web server to")
 
@@ -1283,6 +1221,7 @@ func init() {
 
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
-		log.Fatal(err)
+		slog.Error("Fatal error", "error", err)
+		os.Exit(1)
 	}
 }

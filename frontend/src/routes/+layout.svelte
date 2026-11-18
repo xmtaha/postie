@@ -1,88 +1,123 @@
 <script lang="ts">
-import { goto } from "$app/navigation";
+import { afterNavigate, goto } from "$app/navigation";
 import { page } from "$app/state";
 import apiClient from "$lib/api/client";
-import logo from "$lib/assets/images/logo.png";
+import DragStrip from "$lib/components/shell/DragStrip.svelte";
+import Sidebar from "$lib/components/shell/Sidebar.svelte";
+import Toolbar from "$lib/components/shell/Toolbar.svelte";
 import ToastContainer from "$lib/components/ToastContainer.svelte";
 import { t } from "$lib/i18n";
+import { fly } from "$lib/motion";
 import { appStatus } from "$lib/stores/app";
+import { initPlatform } from "$lib/stores/platform";
 import { toastStore } from "$lib/stores/toast";
-import { ChartPie, FileText, Settings, Activity, Palette, Globe } from "lucide-svelte";
-import { availableThemes, currentTheme, type ThemeValue } from "$lib/stores/theme";
-import { availableLocales, locale, setStoredLocale } from "$lib/i18n";
+import { AlertCircle } from "lucide-svelte";
 import { onMount, onDestroy } from "svelte";
+import "$lib/stores/theme"; // registers the OS colour-scheme listener on every route
+import type { Snippet } from "svelte";
+
+interface Props {
+	children: Snippet;
+}
+
+let { children }: Props = $props();
 import "../style.css";
 
+let authReady = $state(false);
+let authError = $state("");
+let webAuthenticated = $state(false);
 let needsConfiguration = $state(false);
 let criticalConfigError = $state(false);
 let connectionStatus: "connected" | "reconnecting" | "disconnected" = $state("connected");
 let connectionCheckInterval: ReturnType<typeof setInterval> | undefined;
+let drawerOpen = $state(false);
+let scrollPane = $state<HTMLElement>();
+
+// Setup and login render full screen, without the sidebar shell.
+let plainRoute = $derived(page.route.id === "/setup" || page.route.id === "/login");
+
+afterNavigate(() => {
+	// The content pane (not the window) scrolls, so reset it per navigation.
+	scrollPane?.scrollTo({ top: 0, behavior: "instant" });
+	drawerOpen = false;
+});
 
 onMount(async () => {
-	// Initialize theme from localStorage or system preference
-	const savedTheme = localStorage.getItem("theme");
-	const systemPrefersDark = window.matchMedia(
-		"(prefers-color-scheme: dark)",
-	).matches;
-	const defaultTheme = savedTheme || (systemPrefersDark ? "dark" : "light");
-	document.documentElement.setAttribute("data-theme", defaultTheme);
+	try {
+		await initPlatform();
 
-	// Initialize API client (detects environment and sets up appropriate client)
-	await apiClient.initialize();
-
-	// Listen for config updates
-	await apiClient.on("config-updated", async () => {
-		await loadAppStatus();
-	});
-
-	// Listen for menu navigation events (desktop only)
-	if (apiClient.environment === "wails") {
-		await apiClient.on("navigate-to-settings", () => {
-			goto("/settings");
-		});
-
-		await apiClient.on("navigate-to-dashboard", () => {
-			goto("/");
-		});
-
-		// Listen for edit menu events (desktop only)
-		await apiClient.on("menu-cut", () => {
-			document.execCommand("cut");
-		});
-
-		await apiClient.on("menu-copy", () => {
-			document.execCommand("copy");
-		});
-
-		await apiClient.on("menu-paste", () => {
-			document.execCommand("paste");
-		});
-
-		await apiClient.on("menu-undo", () => {
-			document.execCommand("undo");
-		});
-
-		await apiClient.on("menu-redo", () => {
-			document.execCommand("redo");
-		});
-
-		await apiClient.on("menu-select-all", () => {
-			document.execCommand("selectAll");
-		});
-	}
-
-	// Load initial app status
-	await loadAppStatus();
-
-	// Periodic connection health check
-	connectionCheckInterval = setInterval(async () => {
-		try {
-			await apiClient.getAppStatus();
-			if (connectionStatus !== "connected") connectionStatus = "connected";
-		} catch {
-			connectionStatus = connectionStatus === "connected" ? "reconnecting" : "disconnected";
+		// Gate child pages before their onMount hooks can call privileged APIs.
+		const desktop = !!(window as unknown as {go?: {backend?: {App?: unknown}}}).go?.backend?.App;
+		if (page.route.id === "/login") { authReady = true; return; }
+		if (!desktop) {
+			const response = await fetch("/api/auth/user", { signal: AbortSignal.timeout(15000) });
+			if (response.status === 401) { window.location.replace("/login"); return; }
+			if (!response.ok) throw new Error($t("common.auth.connectionError"));
+			webAuthenticated = (await response.json()).enabled;
 		}
-	}, 10000);
+		authReady = true;
+
+		// Initialize API client (detects environment and sets up appropriate client)
+		await apiClient.initialize();
+
+		// Listen for config updates
+		await apiClient.on("config-updated", async () => {
+			await loadAppStatus();
+		});
+
+		// Listen for menu navigation events (desktop only)
+		if (apiClient.environment === "wails") {
+			await apiClient.on("navigate-to-settings", () => {
+				goto("/settings");
+			});
+
+			await apiClient.on("navigate-to-dashboard", () => {
+				goto("/");
+			});
+
+			// Listen for edit menu events (desktop only)
+			await apiClient.on("menu-cut", () => {
+				document.execCommand("cut");
+			});
+
+			await apiClient.on("menu-copy", () => {
+				document.execCommand("copy");
+			});
+
+			await apiClient.on("menu-paste", () => {
+				document.execCommand("paste");
+			});
+
+			await apiClient.on("menu-undo", () => {
+				document.execCommand("undo");
+			});
+
+			await apiClient.on("menu-redo", () => {
+				document.execCommand("redo");
+			});
+
+			await apiClient.on("menu-select-all", () => {
+				document.execCommand("selectAll");
+			});
+		}
+
+		// Load initial app status
+		await loadAppStatus();
+
+		// Periodic connection health check
+		connectionCheckInterval = setInterval(async () => {
+			try {
+				await apiClient.getAppStatus();
+				if (connectionStatus !== "connected") connectionStatus = "connected";
+			} catch {
+				connectionStatus = connectionStatus === "connected" ? "reconnecting" : "disconnected";
+			}
+		}, 10000);
+	} catch (error) {
+		console.error("Failed to initialize app:", error);
+		authError = $t("common.auth.connectionError");
+		toastStore.error($t("common.common.error"), (error as Error).message);
+	}
 });
 
 async function loadAppStatus() {
@@ -112,10 +147,7 @@ async function loadAppStatus() {
 		}
 	} catch (error) {
 		console.error("Failed to load app status:", error);
-		// If we can't load app status, redirect to setup to be safe
-		if (page.route.id !== "/setup") {
-			goto("/setup");
-		}
+		// Do not redirect to setup on error — wizard must only show on first start
 	}
 }
 
@@ -123,7 +155,19 @@ onDestroy(() => {
 	if (connectionCheckInterval) clearInterval(connectionCheckInterval);
 });
 
+async function logout() {
+	try {
+		const response = await fetch("/api/auth/logout", { method: "POST", headers: { "Content-Type": "application/json" } });
+		if (!response.ok) throw new Error($t("common.auth.logoutError"));
+		window.location.replace("/login");
+	} catch (error) { toastStore.error($t("common.auth.logoutError"), (error as Error).message); }
+}
+
 function handleKeydown(event: KeyboardEvent) {
+	if (event.key === "Escape" && drawerOpen) {
+		drawerOpen = false;
+		return;
+	}
 	// Skip if user is typing in an input
 	const target = event.target as HTMLElement;
 	if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable) return;
@@ -152,142 +196,136 @@ function handler(error: unknown, _reset: () => void) {
 }
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
+<svelte:window
+	onkeydown={handleKeydown}
+	onresize={() => {
+		if (drawerOpen && window.innerWidth >= 640) drawerOpen = false;
+	}}
+/>
 
-<div class="min-h-screen bg-base-200">
+{#if authReady}
+<div class="app-root" class:plain={plainRoute}>
 	<svelte:boundary onerror={handler}>
-		<!-- Show navbar only if not on setup page -->
-		{#if page.route.id !== "/setup"}
-			<!-- Header/Navigation -->
-			<div class="navbar bg-base-100/95 backdrop-blur-md shadow-lg border-b border-base-300/50 sticky top-0 z-50">
-				<div class="navbar-start">
-					<!-- Logo and Brand -->
-					<div class="flex items-center gap-2 px-2 md:gap-3 md:px-4">
-						<div class="avatar">
-							<div class="w-8 h-8 md:w-12 md:h-10">
-								<img src={logo} alt="Postie UI" class="w-full h-full object-contain" loading="lazy" />
-							</div>
-						</div>
-						<div class="hidden sm:block">
-							<div class="flex items-center gap-2">
-								<h1 class="text-lg md:text-xl font-bold bg-clip-text">
-									Postie
-								</h1>
-							</div>
-							<p class="text-xs text-base-content/60">
-								Upload Manager
-							</p>
-						</div>
-					</div>
-				</div>
-
-				<div class="navbar-center">
-					<!-- Navigation -->
-					<div class="flex items-center gap-1">
-						<button
-							class="btn btn-xs sm:btn-sm {page.route.id === "/" ? "btn-primary shadow-lg" : "btn-ghost hover:bg-base-200"} transition-all duration-200"
-							onclick={() => goto("/")}
-							disabled={needsConfiguration || criticalConfigError}
-							aria-current={page.route.id === "/" ? "page" : undefined}
-							title={$t('common.nav.dashboard')}
-						>
-							<ChartPie class="w-4 h-4" />
-							<span class="hidden sm:inline font-medium">{$t('common.nav.dashboard')}</span>
-						</button>
-						<button
-							class="btn btn-xs sm:btn-sm {page.route.id === "/settings" ? "btn-secondary shadow-lg" : "btn-ghost hover:bg-base-200"} transition-all duration-200"
-							onclick={() => goto("/settings")}
-							aria-current={page.route.id === "/settings" ? "page" : undefined}
-							title={$t('common.nav.settings')}
-						>
-							<Settings class="w-4 h-4" />
-							<span class="hidden sm:inline font-medium">{$t('common.nav.settings')}</span>
-						</button>
-						<button
-							class="btn btn-xs sm:btn-sm {page.route.id === "/metrics" ? "btn-info shadow-lg" : "btn-ghost hover:bg-base-200"} transition-all duration-200"
-							onclick={() => goto("/metrics")}
-							disabled={needsConfiguration || criticalConfigError}
-							aria-current={page.route.id === "/metrics" ? "page" : undefined}
-							title={$t('common.nav.metrics')}
-						>
-							<Activity class="w-4 h-4" />
-							<span class="hidden sm:inline font-medium">{$t('common.nav.metrics')}</span>
-						</button>
-						<button
-							class="btn btn-xs sm:btn-sm {page.route.id === "/logs" ? "btn-accent shadow-lg" : "btn-ghost hover:bg-base-200"} transition-all duration-200"
-							onclick={() => goto("/logs")}
-							aria-current={page.route.id === "/logs" ? "page" : undefined}
-							title={$t('common.nav.logs')}
-						>
-							<FileText class="w-4 h-4" />
-							<span class="hidden sm:inline font-medium">{$t('common.nav.logs')}</span>
-						</button>
-					</div>
-				</div>
-
-				<div class="navbar-end gap-1.5">
-					<div class="tooltip tooltip-bottom" data-tip={connectionStatus === "connected" ? $t("common.common.status") + ": OK" : connectionStatus === "reconnecting" ? $t("common.common.loading") : $t("common.common.error")}>
-						<div class="w-2.5 h-2.5 rounded-full {connectionStatus === 'connected' ? 'bg-success' : connectionStatus === 'reconnecting' ? 'bg-warning animate-pulse' : 'bg-error animate-pulse'}"></div>
-					</div>
-
-					<!-- Quick Theme Switcher -->
-					<div class="dropdown dropdown-end">
-						<div tabindex="0" role="button" class="btn btn-ghost btn-xs sm:btn-sm" title={$t("common.nav.theme")}>
-							<Palette class="w-4 h-4" />
-						</div>
-						<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-						<ul tabindex="0" class="dropdown-content menu bg-base-200 rounded-box z-50 w-40 p-2 shadow-lg">
-							{#each availableThemes as theme}
-								<li>
-									<button
-										class:active={$currentTheme === theme.value}
-										onclick={() => currentTheme.setTheme(theme.value)}
-									>
-										{theme.name}
-									</button>
-								</li>
-							{/each}
-						</ul>
-					</div>
-
-					<!-- Quick Language Switcher -->
-					<div class="dropdown dropdown-end">
-						<div tabindex="0" role="button" class="btn btn-ghost btn-xs sm:btn-sm" title={$t("common.nav.language")}>
-							<Globe class="w-4 h-4" />
-						</div>
-						<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-						<ul tabindex="0" class="dropdown-content menu bg-base-200 rounded-box z-50 w-40 p-2 shadow-lg">
-							{#each availableLocales as lang}
-								<li>
-									<button
-										class:active={$locale === lang.code}
-										onclick={() => { setStoredLocale(lang.code); locale.set(lang.code); }}
-									>
-										{lang.flag} {lang.name}
-									</button>
-								</li>
-							{/each}
-						</ul>
-					</div>
-
-					{#if $appStatus?.version}
-						<span class="badge badge-ghost text-xs opacity-70 hidden sm:inline-flex">
-							{$appStatus.version}
-						</span>
+		{#if plainRoute}
+			<div class="shell-plain">
+				<DragStrip>
+					{#if webAuthenticated && page.route.id === "/setup"}
+						<button class="btn btn-sm btn-ghost" data-testid="sign-out" onclick={logout}>{$t("common.auth.signOut")}</button>
 					{/if}
+				</DragStrip>
+				{@render children()}
+			</div>
+		{:else}
+			<div class="app-shell">
+				<Sidebar
+					activeRoute={page.route.id}
+					configBlocked={needsConfiguration || criticalConfigError}
+					connection={connectionStatus}
+					version={$appStatus?.version}
+					{webAuthenticated}
+					{drawerOpen}
+					onLogout={logout}
+					onClose={() => (drawerOpen = false)}
+				/>
+				<div class="shell-main" inert={drawerOpen}>
+					<Toolbar activeRoute={page.route.id} onMenu={() => (drawerOpen = true)} />
+					<main class="shell-scroll" bind:this={scrollPane}>
+						{#key page.route.id}
+							<div class="shell-page" in:fly={{ y: 6 }}>
+								{@render children()}
+							</div>
+						{/key}
+					</main>
 				</div>
 			</div>
-
-			<!-- Page Content -->
-			<main class="container mx-auto px-4 py-8 max-w-7xl animate-fade-in">
-				<slot />
-			</main>
-		{:else}
-			<!-- Setup page takes full screen -->
-			<slot />
 		{/if}
+	{#snippet failed(error)}
+		<div class="flex h-full flex-col items-center justify-center text-center space-y-6 p-6">
+			<div class="p-6 bg-error/15 rounded-full">
+				<AlertCircle class="w-16 h-16 text-error" />
+			</div>
+			<div class="space-y-2">
+				<h1 class="text-2xl font-bold">{$t('common.common.error')}</h1>
+				<p class="text-base-content/70">{(error as Error).message}</p>
+			</div>
+			<button class="btn btn-primary" onclick={() => window.location.reload()}>
+				Reload
+			</button>
+		</div>
+	{/snippet}
 	</svelte:boundary>
 
 	<!-- Toast notifications -->
 	<ToastContainer />
 </div>
+{:else}
+	<div class="flex h-dvh flex-col">
+	<DragStrip />
+	<div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6">
+		{#if authError}
+			<p class="alert alert-error max-w-md" role="alert">{authError}</p>
+			<button class="btn btn-primary" onclick={() => window.location.reload()}>{$t("common.auth.retry")}</button>
+		{:else}<span class="loading loading-spinner"></span>{/if}
+	</div>
+	</div>
+{/if}
+
+<style>
+	.app-root {
+		position: fixed;
+		inset: 0;
+		display: flex;
+		flex-direction: column;
+		min-width: 0;
+	}
+	.app-root.plain {
+		background: var(--color-base-200);
+	}
+	.shell-plain {
+		flex: 1;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+		overflow-y: auto;
+		overscroll-behavior: none;
+	}
+	/* Fill whatever the drag strip leaves, instead of a fixed viewport height (avoids a needless scroll) */
+	.shell-plain :global(.min-h-screen) {
+		flex: 1 0 auto;
+		min-height: 0;
+	}
+	.app-shell {
+		flex: 1;
+		min-height: 0;
+		display: flex;
+	}
+	.shell-main {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		background: var(--surface-content);
+	}
+	.shell-scroll {
+		flex: 1;
+		min-height: 0;
+		overflow-x: hidden;
+		overflow-y: auto;
+		overscroll-behavior: none;
+		scroll-behavior: smooth;
+	}
+	.shell-page {
+		width: 100%;
+		max-width: 80rem;
+		margin-inline: auto;
+		padding: 1.25rem 1.5rem 2rem;
+	}
+	.shell-page :global(.min-h-screen) {
+		min-height: 100%;
+	}
+	@media (max-width: 639px) {
+		.shell-page {
+			padding: 1rem 0.75rem 1.5rem;
+		}
+	}
+</style>

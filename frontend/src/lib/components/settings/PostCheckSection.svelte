@@ -1,10 +1,11 @@
 <script lang="ts">
-import apiClient from "$lib/api/client";
 import DurationInput from "$lib/components/inputs/DurationInput.svelte";
 import { t } from "$lib/i18n";
-import { toastStore } from "$lib/stores/toast";
 import type { config as configType } from "$lib/wailsjs/go/models";
-import { CheckCircle, Save } from "lucide-svelte";
+import NumberField from "$lib/components/inputs/NumberField.svelte";
+import ToggleRow from "$lib/components/inputs/ToggleRow.svelte";
+import SettingsSection from "./SettingsSection.svelte";
+import { collapse } from "./collapse";
 
 const presets = [
 	{ label: "5s", value: 5, unit: "s" },
@@ -14,16 +15,17 @@ const presets = [
 ];
 
 const deferredDelayPresets = [
-	{ label: "2m", value: 2, unit: "m" },
+	{ label: "30s", value: 30, unit: "s" },
+	{ label: "1m", value: 1, unit: "m" },
 	{ label: "5m", value: 5, unit: "m" },
 	{ label: "10m", value: 10, unit: "m" },
-	{ label: "30m", value: 30, unit: "m" },
 ];
 
 const deferredBackoffPresets = [
+	{ label: "5m", value: 5, unit: "m" },
+	{ label: "15m", value: 15, unit: "m" },
 	{ label: "30m", value: 30, unit: "m" },
 	{ label: "1h", value: 1, unit: "h" },
-	{ label: "2h", value: 2, unit: "h" },
 ];
 
 const deferredIntervalPresets = [
@@ -42,21 +44,13 @@ let { config = $bindable() }: Props = $props();
 let enabled = $state(config.post_check?.enabled ?? true);
 let delay = $state(config.post_check?.delay || "10s");
 let maxReposts = $state(config.post_check?.max_reposts || 1);
-let deferredCheckDelay = $state(config.post_check?.deferred_check_delay || "5m");
+let deferredCheckDelay = $state(config.post_check?.deferred_check_delay || "30s");
 let deferredMaxRetries = $state(config.post_check?.deferred_max_retries || 5);
-let deferredMaxBackoff = $state(config.post_check?.deferred_max_backoff || "1h");
+let deferredMaxBackoff = $state(config.post_check?.deferred_max_backoff || "5m");
 let deferredCheckInterval = $state(config.post_check?.deferred_check_interval || "2m");
-let saving = $state(false);
-
-// Derived state
-let canSave = $derived(
-	delay.trim() &&
-	maxReposts >= 0 &&
-	maxReposts <= 10 &&
-	deferredMaxRetries >= 1 &&
-	deferredMaxRetries <= 20 &&
-	!saving
-);
+let deferredBatchSize = $state(config.post_check?.deferred_batch_size || 10000);
+let statBatchSize = $state(config.post_check?.stat_batch_size || 100);
+let maxConcurrentChecks = $state(config.post_check?.max_concurrent_checks ?? 0);
 
 // Ensure post_check exists with defaults
 if (!config.post_check) {
@@ -64,10 +58,13 @@ if (!config.post_check) {
 		enabled: true,
 		delay: "10s",
 		max_reposts: 1,
-		deferred_check_delay: "5m",
+		deferred_check_delay: "30s",
 		deferred_max_retries: 5,
-		deferred_max_backoff: "1h",
+		deferred_max_backoff: "5m",
 		deferred_check_interval: "2m",
+		deferred_batch_size: 10000,
+		stat_batch_size: 100,
+		max_concurrent_checks: 0,
 	};
 }
 
@@ -100,185 +97,125 @@ $effect(() => {
 	config.post_check.deferred_check_interval = deferredCheckInterval;
 });
 
-async function savePostCheckSettings() {
-	try {
-		saving = true;
+$effect(() => {
+	config.post_check.deferred_batch_size = deferredBatchSize;
+});
 
-		// Get the current config from the server to avoid conflicts
-		const currentConfig = await apiClient.getConfig();
+$effect(() => {
+	config.post_check.stat_batch_size = statBatchSize;
+});
 
-		// Validation
-		if (!delay.trim()) {
-			throw new Error("Delay is required");
-		}
+$effect(() => {
+	config.post_check.max_concurrent_checks = maxConcurrentChecks;
+});
 
-		if (maxReposts < 0 || maxReposts > 10) {
-			throw new Error("Max reposts must be between 0 and 10");
-		}
-
-		// Only update the post_check fields with proper type conversion
-		currentConfig.post_check = {
-			enabled: enabled,
-			delay: delay.trim(),
-			max_reposts: maxReposts,
-			deferred_check_delay: deferredCheckDelay.trim(),
-			deferred_max_retries: deferredMaxRetries,
-			deferred_max_backoff: deferredMaxBackoff.trim(),
-			deferred_check_interval: deferredCheckInterval.trim(),
-		};
-
-		await apiClient.saveConfig(currentConfig);
-	} catch (error) {
-		console.error("Failed to save post check settings:", error);
-		toastStore.error($t("common.messages.error_saving"), String(error));
-	} finally {
-		saving = false;
-	}
-}
 </script>
 
-<div class="card bg-base-100 shadow-xl">
-  <div class="card-body space-y-6">
-    <div class="flex items-center gap-3">
-      <CheckCircle class="w-5 h-5 text-orange-600 dark:text-orange-400" />
-      <h2 class="card-title text-lg">
-        {$t('settings.post_check.title')}
-      </h2>
-    </div>
+<SettingsSection
+	title={$t('settings.post_check.title')}
+	footer={`${$t('settings.post_check.info_title')} ${$t('settings.post_check.info_description')}`}
+>
+	<ToggleRow
+		id="post-check-enabled"
+		bind:checked={enabled}
+		label={$t('settings.post_check.enable')}
+		description={$t('settings.post_check.enable_description')}
+	/>
 
-    <div class="form-control">
-      <label class="label cursor-pointer justify-start gap-3">
-        <input type="checkbox" class="checkbox" bind:checked={enabled} />
-        <span class="label-text">{$t('settings.post_check.enable')}</span>
-      </label>
-      <div class="label">
-        <span class="label-text-alt ml-8">
-          {$t('settings.post_check.enable_description')}
-        </span>
-      </div>
-    </div>
+	{#if enabled}
+		<div transition:collapse class="border-t border-(--ui-hairline)">
+			<DurationInput
+				id="check-delay"
+				bind:value={delay}
+				label={$t('settings.post_check.check_delay')}
+				description={$t('settings.post_check.check_delay_description')}
+				placeholder="10"
+				minValue={1}
+				maxValue={300}
+				presets={presets}
+			/>
+			<NumberField
+				id="max-reposts"
+				bind:value={maxReposts}
+				label={$t('settings.post_check.max_reposts')}
+				description={$t('settings.post_check.max_reposts_description')}
+				minValue={0}
+				maxValue={10}
+			/>
+		</div>
+	{/if}
+</SettingsSection>
 
-    {#if enabled}
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div>
-          <DurationInput
-            id="check-delay"
-            bind:value={delay}
-            label={$t('settings.post_check.check_delay')}
-            description={$t('settings.post_check.check_delay_description')}
-            placeholder="10"
-            minValue={1}
-            maxValue={300}
-            presets={presets}
-          />
-        </div>
-
-        <div class="form-control">
-          <label class="label" for="max-reposts">
-            <span class="label-text">{$t('settings.post_check.max_reposts')}</span>
-          </label>
-          <input
-            id="max-reposts"
-            type="number"
-            class="input input-bordered"
-            bind:value={maxReposts}
-            min="0"
-            max="10"
-          />
-          <div class="label">
-            <span class="label-text-alt">
-              {$t('settings.post_check.max_reposts_description')}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      <!-- Deferred Check Section -->
-      <div class="divider text-sm text-base-content/50">{$t('settings.post_check.deferred_title')}</div>
-
-      <div class="alert alert-info">
-        <span class="text-sm">
-          {$t('settings.post_check.deferred_info')}
-        </span>
-      </div>
-
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div>
-          <DurationInput
-            id="deferred-check-delay"
-            bind:value={deferredCheckDelay}
-            label={$t('settings.post_check.deferred_check_delay')}
-            description={$t('settings.post_check.deferred_check_delay_description')}
-            placeholder="5m"
-            minValue={1}
-            maxValue={60}
-            presets={deferredDelayPresets}
-          />
-        </div>
-
-        <div class="form-control">
-          <label class="label" for="deferred-max-retries">
-            <span class="label-text">{$t('settings.post_check.deferred_max_retries')}</span>
-          </label>
-          <input
-            id="deferred-max-retries"
-            type="number"
-            class="input input-bordered"
-            bind:value={deferredMaxRetries}
-            min="1"
-            max="20"
-          />
-          <div class="label">
-            <span class="label-text-alt">
-              {$t('settings.post_check.deferred_max_retries_description')}
-            </span>
-          </div>
-        </div>
-
-        <div>
-          <DurationInput
-            id="deferred-max-backoff"
-            bind:value={deferredMaxBackoff}
-            label={$t('settings.post_check.deferred_max_backoff')}
-            description={$t('settings.post_check.deferred_max_backoff_description')}
-            placeholder="1h"
-            minValue={1}
-            maxValue={24}
-            presets={deferredBackoffPresets}
-          />
-        </div>
-
-        <div>
-          <DurationInput
-            id="deferred-check-interval"
-            bind:value={deferredCheckInterval}
-            label={$t('settings.post_check.deferred_check_interval')}
-            description={$t('settings.post_check.deferred_check_interval_description')}
-            placeholder="2m"
-            minValue={1}
-            maxValue={30}
-            presets={deferredIntervalPresets}
-          />
-        </div>
-      </div>
-    {/if}
-
-    <div class="alert alert-warning">
-      <span class="text-sm">
-        <strong>{$t('settings.post_check.info_title')}</strong> {$t('settings.post_check.info_description')}
-      </span>
-    </div>
-
-    <!-- Save Button -->
-    <div class="card-actions pt-4 border-t border-base-300">
-      <button
-        class="btn btn-success"
-        onclick={savePostCheckSettings}
-        disabled={!canSave}
-      >
-        <Save class="w-4 h-4" />
-        {saving ? $t('common.common.saving') : $t('settings.post_check.save_button')}
-      </button>
-    </div>
-  </div>
-</div>
+{#if enabled}
+	<div transition:collapse>
+		<div>
+			<SettingsSection
+				title={$t('settings.post_check.deferred_title')}
+				description={$t('settings.post_check.deferred_info')}
+			>
+				<DurationInput
+					id="deferred-check-delay"
+					bind:value={deferredCheckDelay}
+					label={$t('settings.post_check.deferred_check_delay')}
+					description={$t('settings.post_check.deferred_check_delay_description')}
+					placeholder="5m"
+					minValue={1}
+					maxValue={60}
+					presets={deferredDelayPresets}
+				/>
+				<NumberField
+					id="deferred-max-retries"
+					bind:value={deferredMaxRetries}
+					label={$t('settings.post_check.deferred_max_retries')}
+					description={$t('settings.post_check.deferred_max_retries_description')}
+					minValue={1}
+					maxValue={20}
+				/>
+				<DurationInput
+					id="deferred-max-backoff"
+					bind:value={deferredMaxBackoff}
+					label={$t('settings.post_check.deferred_max_backoff')}
+					description={$t('settings.post_check.deferred_max_backoff_description')}
+					placeholder="1h"
+					minValue={1}
+					maxValue={24}
+					presets={deferredBackoffPresets}
+				/>
+				<DurationInput
+					id="deferred-check-interval"
+					bind:value={deferredCheckInterval}
+					label={$t('settings.post_check.deferred_check_interval')}
+					description={$t('settings.post_check.deferred_check_interval_description')}
+					placeholder="2m"
+					minValue={1}
+					maxValue={30}
+					presets={deferredIntervalPresets}
+				/>
+				<NumberField
+					id="deferred-batch-size"
+					bind:value={deferredBatchSize}
+					label={$t('settings.post_check.deferred_batch_size')}
+					description={$t('settings.post_check.deferred_batch_size_description')}
+					minValue={1}
+					maxValue={10000}
+				/>
+				<NumberField
+					id="stat-batch-size"
+					bind:value={statBatchSize}
+					label={$t('settings.post_check.stat_batch_size')}
+					description={$t('settings.post_check.stat_batch_size_description')}
+					minValue={1}
+					maxValue={1000}
+				/>
+				<NumberField
+					id="max-concurrent-checks"
+					bind:value={maxConcurrentChecks}
+					label={$t('settings.post_check.max_concurrent_checks')}
+					description={$t('settings.post_check.max_concurrent_checks_description')}
+					minValue={0}
+					maxValue={64}
+				/>
+			</SettingsSection>
+		</div>
+	</div>
+{/if}

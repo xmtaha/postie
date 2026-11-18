@@ -8,15 +8,20 @@
 			"description": "Gestiona tus cargas de archivos y monitorea el progreso",
 			"add_files": "Agregar Archivos",
 			"add_folder": "Agregar Carpeta",
-			"add_folder_tooltip": "Subir una carpeta entera como un solo NZB",
+			"add_folder_tooltip": "Subir una o más carpetas, cada una como un solo NZB",
 			"folder_added": "Carpeta Agregada",
 			"folder_added_description": "La carpeta ha sido agregada a la cola de carga",
+			"folders_added": "Carpetas Agregadas",
+			"folders_added_description": "{{count}} carpetas han sido agregadas a la cola de carga",
 			"import_files": "Importar Archivos",
 			"import_files_tooltip": "Explorar e importar archivos desde el servidor remoto",
 			"clear_completed": "Limpiar Completados"
 		},
 		"queue": {
+			"reused_nzb": "NZB reutilizado",
 			"title": "Cola de Carga",
+			"search_placeholder": "Buscar archivo…",
+			"search_within_page": "solo página actual",
 			"items": "elementos",
 			"total_size": "Tamaño Total",
 			"progress": "Progreso",
@@ -52,6 +57,9 @@
 			"next": "Siguiente",
 			"retry_all_failed": "Reintentar Fallidos",
 			"bulk_retry_success": "Se reintentaron {count} elementos exitosamente",
+			"delete_selected": "Eliminar seleccionados ({count})",
+			"confirm_delete_selected": "¿Estás seguro de que deseas eliminar {count} elementos seleccionados? Esta acción no se puede deshacer.",
+			"batch_deleted": "{count} elementos eliminados de la cola.",
 			"status_types": {
 				"pending": "pendiente",
 				"complete": "completo",
@@ -61,10 +69,19 @@
 				"completed": "Completado",
 				"failed": "Fallido"
 			},
+			"verification": {
+				"pending": "Verificando",
+				"failed": "Verificación fallida",
+				"progress": "{verified} de {total} verificados"
+			},
+			"duration": "Duración",
+			"processing_time": "Tiempo de procesamiento",
 			"nzb": "NZB"
 		},
 		"progress": {
 			"title": "Progreso de Carga",
+			"file_size": "Tamaño de archivo",
+			"path": "Ruta",
 			"status": {
 				"active": "Activo",
 				"idle": "Inactivo",
@@ -73,7 +90,8 @@
 			"task_status": {
 				"paused": "Pausado",
 				"in_progress": "En Progreso",
-				"pending": "Pendiente"
+				"pending": "Pendiente",
+				"waiting": "Esperando propagación..."
 			},
 			"pause_processing": "Pausar Procesamiento",
 			"resume_processing": "Reanudar Procesamiento",
@@ -120,6 +138,10 @@
 				"successfully_finished": "Terminado exitosamente",
 				"errors_detected": "Errores Detectados",
 				"failed_to_process": "Elementos que fallaron al procesar",
+				"pending_verification": "Verificación Pendiente",
+				"pending_verification_hint": "Subido; esperando verificación en segundo plano",
+				"verification_failed": "Verificación Fallida",
+				"verification_failed_hint": "Algunos artículos no pudieron verificarse; los originales se conservan",
 				"failed_items": "Elementos fallidos",
 				"queue_progress": "Progreso de Cola",
 				"overall_completion": "Estado general de finalización",
@@ -138,6 +160,7 @@
 		"job_failed": "Subida fallida: {fileName}",
 		"file_explorer": {
 			"title": "Agregar Archivos del Servidor a la Cola",
+			"close": "Cerrar",
 			"import_success": "Archivos agregados a la cola exitosamente",
 			"no_files_selected": "No se han seleccionado archivos",
 			"import_success_description": "Se {count, plural, =1 {agregó} other {agregaron}} {count} {count, plural, =1 {archivo} other {archivos}} a la cola correctamente",
@@ -163,21 +186,29 @@
 			"error": "Error al cargar el estado del proveedor",
 			"anonymous": "Anónimo",
 			"connections": "Conexiones",
-			"success_rate": "Tasa de Éxito",
-			"uploaded": "Subido",
-			"articles": "Artículos",
-			"idle_connections": "Inactivas",
+			"avg_speed": "Velocidad Media",
+			"missing": "Faltantes",
+			"errors": "Errores",
+			"elapsed": "Tiempo activo",
 			"pool_summary": "Resumen del Pool",
 			"active_connections": "conexiones activas",
-			"total_uploaded": "Total Subido",
+			"total_errors": "Errores Totales",
 			"no_providers": "No hay proveedores configurados",
+			"inflight": "Profundidad de pipeline",
+			"current_speed": "Velocidad Actual",
+			"ttfb": "TTFB",
+			"downloaded": "Descargado",
+			"uploaded": "Subido",
+			"upload_speed": "Velocidad de subida",
+			"avg_upload_speed": "Velocidad media de subida",
+			"free_slots": "libres",
+			"quota": "Cuota",
+			"quota_exceeded": "Excedida",
+			"quota_resets": "Se reinicia",
 			"status": {
 				"connected": "Conectado",
-				"connecting": "Conectando",
-				"reconnecting": "Reconectando",
-				"failed": "Falló",
-				"disconnected": "Desconectado",
-				"unknown": "Desconocido"
+				"idle": "Inactivo",
+				"failed": "Falló"
 			}
 		},
 		"watcher": {
@@ -194,7 +225,12 @@
 			"next_run_soon": "Pronto",
 			"next_run_minutes": "en {count} {count, plural, =1 {minuto} other {minutos}}",
 			"next_run_hours": "en {count} {count, plural, =1 {hora} other {horas}}",
-			"next_run_days": "en {count} {count, plural, =1 {día} other {días}}"
+			"next_run_days": "en {count} {count, plural, =1 {día} other {días}}",
+			"scan_now": "Escanear ahora",
+			"scan_triggered": "Escaneo iniciado",
+			"scan_triggered_description": "Se ha iniciado el escaneo del directorio",
+			"watcher_number": "Monitor #{n}",
+			"no_watchers": "No hay directorios de vigilancia configurados"
 		}
 	}
 }

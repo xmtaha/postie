@@ -7,14 +7,23 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
-	"github.com/javi11/postie/internal/database"
+	"github.com/google/uuid"
+	"github.com/kipsilabs/postie/internal/database"
+	"github.com/kipsilabs/postie/internal/manifest"
 	_ "github.com/mattn/go-sqlite3"
 	"maragu.dev/goqite"
 )
 
 var _ QueueInterface = (*Queue)(nil)
+
+// genTransferID returns a new stable transfer identifier for a queue job.
+func genTransferID() string {
+	return uuid.NewString()
+}
 
 // PaginationParams defines parameters for paginated queries
 type PaginationParams struct {
@@ -39,12 +48,22 @@ type PaginatedResult struct {
 // QueueInterface defines the interface for queue operations
 type QueueInterface interface {
 	AddFile(ctx context.Context, path string, size int64) error
+	AddFileWithOptions(ctx context.Context, path string, size int64, opts AddOptions) error
 	GetQueueItems(params PaginationParams) (*PaginatedResult, error)
 	RemoveFromQueue(id string) error
 	ClearQueue() error
-	GetQueueStats() (map[string]interface{}, error)
+	GetQueueStats() (map[string]any, error)
 	SetQueueItemPriorityWithReorder(ctx context.Context, id string, newPriority int) error
 	IsPathInQueue(path string) (bool, error)
+	PendingTotalSize(ctx context.Context) (int64, error)
+}
+
+// AddOptions carries optional per-job fields when adding to the queue.
+// Zero values preserve existing behavior; only the API entry point sets these today.
+type AddOptions struct {
+	Priority       int
+	InputFolder    string // overrides processor's inferred root for relative-path → NZB output
+	DeleteOriginal *bool  // overrides watcher.DeleteOriginalFile for this job only
 }
 
 type Queue struct {
@@ -52,6 +71,14 @@ type Queue struct {
 	db        *sql.DB
 	runCtx    context.Context
 	runCancel context.CancelFunc
+
+	// addMu serializes check-then-insert in the duplicate-checking Add* methods.
+	// goqite.Send uses its own *sql.DB handle so a SQL transaction cannot span
+	// IsPathInQueue + Send; we close the TOCTOU window at the application level.
+	// See issue #184: under MaxConcurrentUploads > 1 the watcher and processor
+	// can both race to add the same path between the IsPathInQueue check and
+	// the Send call.
+	addMu sync.Mutex
 }
 
 type QueueItem struct {
@@ -68,10 +95,15 @@ type QueueItem struct {
 	CompletedAt  *time.Time `json:"completedAt"`
 	NzbPath      *string    `json:"nzbPath"`
 	// Script execution tracking fields
-	ScriptStatus      *string    `json:"scriptStatus"`      // null, completed, pending_retry, failed_permanent
+	ScriptStatus      *string    `json:"scriptStatus"` // null, completed, pending_retry, failed_permanent
 	ScriptRetryCount  int        `json:"scriptRetryCount"`
 	ScriptLastError   *string    `json:"scriptLastError"`
 	ScriptNextRetryAt *time.Time `json:"scriptNextRetryAt"`
+	// Verification status for completed items (null for non-completed)
+	VerificationStatus *string `json:"verificationStatus"` // verified, pending_verification, verification_failed, reused
+	// Deferred verification progress (only set while pending_verification)
+	VerifiedArticles *int `json:"verifiedArticles,omitempty"`
+	TotalArticles    *int `json:"totalArticles,omitempty"`
 }
 
 type FileJob struct {
@@ -80,6 +112,18 @@ type FileJob struct {
 	Priority   int       `json:"priority"`
 	CreatedAt  time.Time `json:"createdAt"`
 	RetryCount int       `json:"retryCount"`
+	// TransferID is a stable identifier assigned when the job is first created.
+	// It is carried through the persisted job body so it survives queue retries
+	// and crash recovery, letting the durable upload architecture reuse the same
+	// manifest and Message-IDs across attempts.
+	TransferID string `json:"transferId,omitempty"`
+	// InputFolder is the root directory used to derive the relative path
+	// for NZB output. When empty, the processor falls back to its existing
+	// inference (FOLDER: prefix → parent, watch folder match, or file dir).
+	InputFolder string `json:"inputFolder,omitempty"`
+	// DeleteOriginal optionally overrides the global delete-original setting
+	// for this specific job. nil → use the processor's default.
+	DeleteOriginal *bool `json:"deleteOriginal,omitempty"`
 }
 
 type CompletedItem struct {
@@ -115,16 +159,90 @@ func New(ctx context.Context, database *database.Database) (*Queue, error) {
 
 	runCtx, runCancel := context.WithCancel(ctx)
 
-	return &Queue{
+	q := &Queue{
 		queue:     queue,
 		db:        database.DB,
 		runCtx:    runCtx,
 		runCancel: runCancel,
-	}, nil
+	}
+
+	// Recover any items that were in-progress when the app last crashed.
+	// These items were deleted from goqite but not yet completed or errored.
+	q.recoverInProgressItems(ctx)
+
+	return q, nil
+}
+
+// DB returns the underlying database handle so adjacent stores (e.g. the
+// durable transfer store) can share the same connection.
+func (q *Queue) DB() *sql.DB {
+	return q.db
+}
+
+// recoverInProgressItems re-queues any items that were being processed when the app crashed.
+// These items exist in in_progress_items but not in goqite, completed_items, or errored_items.
+func (q *Queue) recoverInProgressItems(ctx context.Context) {
+	rows, err := q.db.QueryContext(ctx, `
+		SELECT id, path, size, priority, created_at, job_data
+		FROM in_progress_items
+	`)
+	if err != nil {
+		slog.WarnContext(ctx, "Failed to query in-progress items for recovery", "error", err)
+		return
+	}
+
+	// Phase 1: collect all rows into memory before closing the cursor.
+	// With SetMaxOpenConns(1) the open rows cursor holds the single connection,
+	// so any write (Send or DELETE) would deadlock if we tried it here.
+	type item struct {
+		id         string
+		path       string
+		size       int64
+		priority   int64
+		createdStr string
+		jobData    []byte
+	}
+
+	var pending []item
+	for rows.Next() {
+		var it item
+		if err := rows.Scan(&it.id, &it.path, &it.size, &it.priority, &it.createdStr, &it.jobData); err != nil {
+			slog.WarnContext(ctx, "Failed to scan in-progress item", "error", err)
+			continue
+		}
+		pending = append(pending, it)
+	}
+	_ = rows.Close() // release the read lock / connection before writing
+
+	// Phase 2: now that the cursor is closed the connection is free for writes.
+	var recovered int
+	for _, it := range pending {
+		// Re-insert into goqite so it will be processed again
+		err := q.queue.Send(ctx, goqite.Message{
+			Body:     it.jobData,
+			Priority: int(it.priority),
+		})
+		if err != nil {
+			slog.WarnContext(ctx, "Failed to re-queue in-progress item", "id", it.id, "path", it.path, "error", err)
+			continue
+		}
+
+		// Remove from in_progress_items now that it is back in the queue
+		_, _ = q.db.ExecContext(ctx, "DELETE FROM in_progress_items WHERE id = ?", it.id)
+		recovered++
+		slog.InfoContext(ctx, "Recovered in-progress item", "id", it.id, "path", it.path)
+	}
+
+	if recovered > 0 {
+		slog.InfoContext(ctx, "Recovered items from previous crash", "count", recovered)
+	}
 }
 
 // AddFile adds a file to the queue for processing
 func (q *Queue) AddFile(ctx context.Context, path string, size int64) error {
+	q.addMu.Lock()
+	defer q.addMu.Unlock()
+
 	// Check if the path already exists in pending queue, completed items, or errored items
 	exists, err := q.IsPathInQueue(path)
 	if err != nil {
@@ -139,8 +257,9 @@ func (q *Queue) AddFile(ctx context.Context, path string, size int64) error {
 		Path:       path,
 		Size:       size,
 		Priority:   0,
-		CreatedAt:  time.Now(),
+		CreatedAt:  time.Now().UTC(),
 		RetryCount: 0,
+		TransferID: genTransferID(),
 	}
 
 	jobData, err := json.Marshal(job)
@@ -156,6 +275,16 @@ func (q *Queue) AddFile(ctx context.Context, path string, size int64) error {
 	})
 }
 
+// AddManualFile adds a user-initiated (manual) upload to the queue. Manual
+// uploads always preserve the original file regardless of the watcher's
+// delete_original_file policy, so the per-job override is pinned to false.
+// Automatic (watcher) uploads must not use this and instead leave the override
+// unset so they continue to honour delete_original_file.
+func (q *Queue) AddManualFile(ctx context.Context, path string, size int64) error {
+	keepOriginal := false
+	return q.AddFileWithOptions(ctx, path, size, AddOptions{DeleteOriginal: &keepOriginal})
+}
+
 // AddFileWithoutDuplicateCheck adds a file to the queue without checking for duplicates
 // This is useful when original files are deleted after processing, making duplicate checks unnecessary
 func (q *Queue) AddFileWithoutDuplicateCheck(ctx context.Context, path string, size int64) error {
@@ -163,8 +292,9 @@ func (q *Queue) AddFileWithoutDuplicateCheck(ctx context.Context, path string, s
 		Path:       path,
 		Size:       size,
 		Priority:   0,
-		CreatedAt:  time.Now(),
+		CreatedAt:  time.Now().UTC(),
 		RetryCount: 0,
+		TransferID: genTransferID(),
 	}
 
 	jobData, err := json.Marshal(job)
@@ -182,6 +312,9 @@ func (q *Queue) AddFileWithoutDuplicateCheck(ctx context.Context, path string, s
 
 // AddFileWithPriority adds a file to the queue with a specific priority
 func (q *Queue) AddFileWithPriority(ctx context.Context, path string, size int64, priority int) error {
+	q.addMu.Lock()
+	defer q.addMu.Unlock()
+
 	// Check if the path already exists in pending queue, completed items, or errored items
 	exists, err := q.IsPathInQueue(path)
 	if err != nil {
@@ -196,8 +329,9 @@ func (q *Queue) AddFileWithPriority(ctx context.Context, path string, size int64
 		Path:       path,
 		Size:       size,
 		Priority:   priority,
-		CreatedAt:  time.Now(),
+		CreatedAt:  time.Now().UTC(),
 		RetryCount: 0,
+		TransferID: genTransferID(),
 	}
 
 	jobData, err := json.Marshal(job)
@@ -220,8 +354,9 @@ func (q *Queue) AddFileWithPriorityWithoutDuplicateCheck(ctx context.Context, pa
 		Path:       path,
 		Size:       size,
 		Priority:   priority,
-		CreatedAt:  time.Now(),
+		CreatedAt:  time.Now().UTC(),
 		RetryCount: 0,
+		TransferID: genTransferID(),
 	}
 
 	jobData, err := json.Marshal(job)
@@ -237,7 +372,69 @@ func (q *Queue) AddFileWithPriorityWithoutDuplicateCheck(ctx context.Context, pa
 	})
 }
 
-// ReceiveFile gets the next file job from the queue and removes it immediately
+// AddFileWithOptions adds a file to the queue with optional per-job overrides
+// (priority, input folder for relative-path output, delete-original flag).
+// Skips the add if the path is already tracked anywhere in the queue.
+func (q *Queue) AddFileWithOptions(ctx context.Context, path string, size int64, opts AddOptions) error {
+	q.addMu.Lock()
+	defer q.addMu.Unlock()
+
+	exists, err := q.IsPathInQueue(path)
+	if err != nil {
+		return fmt.Errorf("failed to check if path exists: %w", err)
+	}
+	if exists {
+		slog.DebugContext(ctx, "File already exists in queue, ignoring", "path", path)
+		return nil
+	}
+
+	job := FileJob{
+		Path:           path,
+		Size:           size,
+		Priority:       opts.Priority,
+		CreatedAt:      time.Now().UTC(),
+		RetryCount:     0,
+		TransferID:     genTransferID(),
+		InputFolder:    opts.InputFolder,
+		DeleteOriginal: opts.DeleteOriginal,
+	}
+
+	jobData, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("failed to marshal job: %w", err)
+	}
+
+	slog.InfoContext(ctx, "Adding file to queue with options",
+		"path", path, "size", size,
+		"priority", opts.Priority,
+		"inputFolder", opts.InputFolder,
+		"hasDeleteOverride", opts.DeleteOriginal != nil,
+	)
+
+	return q.queue.Send(ctx, goqite.Message{
+		Body:     jobData,
+		Priority: job.Priority,
+	})
+}
+
+// PendingTotalSize returns the sum of pending FileJob sizes still queued in
+// goqite. Used by the processor to gate pickup behind queue.min_size_to_start.
+func (q *Queue) PendingTotalSize(ctx context.Context) (int64, error) {
+	var total sql.NullInt64
+	err := q.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(CAST(json_extract(body, '$.size') AS INTEGER)), 0)
+		FROM goqite
+		WHERE queue = 'file_jobs'
+	`).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("failed to compute pending total size: %w", err)
+	}
+	return total.Int64, nil
+}
+
+// ReceiveFile gets the next file job from the queue and removes it immediately.
+// The item is tracked in the in_progress_items table until CompleteFile or MarkAsError is called.
+// On startup, RecoverInProgressItems restores any items that were lost due to a crash.
 func (q *Queue) ReceiveFile(ctx context.Context) (*goqite.Message, *FileJob, error) {
 	msg, err := q.queue.Receive(ctx)
 	if err != nil {
@@ -256,9 +453,23 @@ func (q *Queue) ReceiveFile(ctx context.Context) (*goqite.Message, *FileJob, err
 		return nil, nil, fmt.Errorf("failed to unmarshal job: %w", err)
 	}
 
+	// Track the item as in-progress before deleting from goqite.
+	// This ensures we can recover it if the app crashes before completion.
+	created := job.CreatedAt.Format("2006-01-02T15:04:05.000Z")
+	_, err = q.db.ExecContext(ctx, `
+		INSERT OR REPLACE INTO in_progress_items (id, path, size, priority, created_at, job_data)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, string(msg.ID), job.Path, job.Size, job.Priority, created, msg.Body)
+	if err != nil {
+		// Non-fatal: log and continue — losing crash recovery is better than blocking the queue
+		slog.WarnContext(ctx, "Failed to track in-progress item", "id", string(msg.ID), "error", err)
+	}
+
 	// Delete the message from the queue immediately when starting to process
 	// If processing fails, we'll re-add it to the queue
 	if err := q.queue.Delete(ctx, msg.ID); err != nil {
+		// Clean up the in_progress entry we just added
+		_, _ = q.db.ExecContext(ctx, "DELETE FROM in_progress_items WHERE id = ?", string(msg.ID))
 		return nil, nil, fmt.Errorf("failed to remove job from queue: %w", err)
 	}
 
@@ -267,6 +478,16 @@ func (q *Queue) ReceiveFile(ctx context.Context) (*goqite.Message, *FileJob, err
 
 // CompleteFile marks a file job as completed and adds it to completed_items table
 func (q *Queue) CompleteFile(ctx context.Context, msgID goqite.ID, nzbPath string, job *FileJob) error {
+	return q.completeFile(ctx, msgID, nzbPath, job, "verified")
+}
+
+// CompleteReusedFile records reuse with the completion insert, so a crash cannot
+// leave reused content labelled as locally verified.
+func (q *Queue) CompleteReusedFile(ctx context.Context, msgID goqite.ID, nzbPath string, job *FileJob) error {
+	return q.completeFile(ctx, msgID, nzbPath, job, "reused")
+}
+
+func (q *Queue) completeFile(ctx context.Context, msgID goqite.ID, nzbPath string, job *FileJob, verificationStatus string) error {
 	// Insert into completed_items table
 	created := job.CreatedAt.Format("2006-01-02T15:04:05.000Z")
 
@@ -277,15 +498,24 @@ func (q *Queue) CompleteFile(ctx context.Context, msgID goqite.ID, nzbPath strin
 	}
 
 	_, err = q.db.Exec(`
-		INSERT INTO completed_items (id, path, size, priority, nzb_path, created_at, job_data)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, string(msgID), job.Path, job.Size, job.Priority, nzbPath, created, jobData)
+		INSERT INTO completed_items (id, path, size, priority, nzb_path, created_at, job_data, verification_status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, string(msgID), job.Path, job.Size, job.Priority, nzbPath, created, jobData, verificationStatus)
 
 	if err != nil {
 		return fmt.Errorf("failed to insert completed item: %w", err)
 	}
 
+	// Remove from in-progress tracking now that it is complete
+	_, _ = q.db.ExecContext(ctx, "DELETE FROM in_progress_items WHERE id = ?", string(msgID))
+
 	return nil
+}
+
+// CancelFile removes a cancelled job from in-progress tracking.
+func (q *Queue) CancelFile(ctx context.Context, msgID goqite.ID) error {
+	_, err := q.db.ExecContext(ctx, "DELETE FROM in_progress_items WHERE id = ?", string(msgID))
+	return err
 }
 
 // ExtendTimeout extends the processing timeout for a file job
@@ -330,6 +560,15 @@ func (q *Queue) GetQueueItems(params PaginationParams) (*PaginatedResult, error)
 		if totalCount > 0 {
 			allItems, err = q.getPendingItemsPaginated(orderBy, offset, params.Limit)
 		}
+	case "running":
+		// Only query in-progress items
+		err = q.db.QueryRow("SELECT COUNT(*) FROM in_progress_items").Scan(&totalCount)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get in-progress items count: %w", err)
+		}
+		if totalCount > 0 {
+			allItems, err = q.getInProgressItemsPaginated(orderBy, offset, params.Limit)
+		}
 	case "complete":
 		// Only query completed items
 		err = q.db.QueryRow("SELECT COUNT(*) FROM completed_items").Scan(&totalCount)
@@ -350,11 +589,16 @@ func (q *Queue) GetQueueItems(params PaginationParams) (*PaginatedResult, error)
 		}
 	default:
 		// No filter or "all" - query all tables
-		var activeCount, completedCount, erroredCount int
+		var activeCount, runningCount, completedCount, erroredCount int
 
 		err = q.db.QueryRow("SELECT COUNT(*) FROM goqite WHERE queue = 'file_jobs'").Scan(&activeCount)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get active items count: %w", err)
+		}
+
+		err = q.db.QueryRow("SELECT COUNT(*) FROM in_progress_items").Scan(&runningCount)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get in-progress items count: %w", err)
 		}
 
 		err = q.db.QueryRow("SELECT COUNT(*) FROM completed_items").Scan(&completedCount)
@@ -367,7 +611,7 @@ func (q *Queue) GetQueueItems(params PaginationParams) (*PaginatedResult, error)
 			return nil, fmt.Errorf("failed to get errored items count: %w", err)
 		}
 
-		totalCount = activeCount + completedCount + erroredCount
+		totalCount = activeCount + runningCount + completedCount + erroredCount
 
 		if totalCount > 0 {
 			// Get items based on sort order and pagination
@@ -399,6 +643,9 @@ func (q *Queue) GetQueueItems(params PaginationParams) (*PaginatedResult, error)
 		}, nil
 	}
 
+	// Attach deferred verification progress to items awaiting verification
+	q.attachVerificationProgress(allItems)
+
 	// Calculate pagination metadata
 	totalPages := (totalCount + params.Limit - 1) / params.Limit // Ceiling division
 
@@ -413,6 +660,102 @@ func (q *Queue) GetQueueItems(params PaginationParams) (*PaginatedResult, error)
 	}
 
 	return result, nil
+}
+
+// attachVerificationProgress populates VerifiedArticles/TotalArticles for items
+// currently awaiting verification. It aggregates transfer_files (durable upload
+// path, article-count weighted per file) first, then falls back to
+// pending_article_checks (legacy deferred path) for items without transfer rows.
+func (q *Queue) attachVerificationProgress(items []QueueItem) {
+	indexByID := make(map[string]int)
+	for i := range items {
+		if items[i].VerificationStatus != nil && *items[i].VerificationStatus == "pending_verification" {
+			indexByID[items[i].ID] = i
+		}
+	}
+	if len(indexByID) == 0 {
+		return
+	}
+
+	// Durable upload path: per-file verification states weighted by article
+	// count. Files mid-verification credit the articles that are not (or no
+	// longer) recorded as open failures, so the bar advances as the
+	// verification service resolves misses.
+	covered := q.applyVerificationCounts(items, indexByID, `
+		SELECT tf.completed_item_id,
+		       SUM(tf.article_count) AS total,
+		       SUM(CASE
+		             WHEN tf.verification_state = 'verified' THEN tf.article_count
+		             WHEN tf.verification_state IN ('verifying', 'verification_failed')
+		               THEN MAX(tf.article_count - COALESCE(vf.open_count, 0), 0)
+		             ELSE 0
+		           END) AS verified
+		FROM transfer_files tf
+		LEFT JOIN (
+			SELECT transfer_id, file_id, COUNT(*) AS open_count
+			FROM verification_failures
+			WHERE state IN ('pending', 'failed')
+			GROUP BY transfer_id, file_id
+		) vf ON vf.transfer_id = tf.transfer_id AND vf.file_id = tf.file_id
+		WHERE tf.completed_item_id IN (%s)
+		GROUP BY tf.completed_item_id
+	`)
+	for _, id := range covered {
+		delete(indexByID, id)
+	}
+	if len(indexByID) == 0 {
+		return
+	}
+
+	// Legacy deferred path: one row per article awaiting recheck.
+	q.applyVerificationCounts(items, indexByID, `
+		SELECT completed_item_id,
+		       COUNT(*) AS total,
+		       SUM(CASE WHEN status = 'verified' THEN 1 ELSE 0 END) AS verified
+		FROM pending_article_checks
+		WHERE completed_item_id IN (%s)
+		GROUP BY completed_item_id
+	`)
+}
+
+// applyVerificationCounts runs a grouped (id, total, verified) query template
+// against the given item IDs and fills in progress on matching items.
+// It returns the IDs that received counts.
+func (q *Queue) applyVerificationCounts(items []QueueItem, indexByID map[string]int, queryTemplate string) []string {
+	placeholders := make([]string, 0, len(indexByID))
+	args := make([]any, 0, len(indexByID))
+	for id := range indexByID {
+		placeholders = append(placeholders, "?")
+		args = append(args, id)
+	}
+
+	query := fmt.Sprintf(queryTemplate, strings.Join(placeholders, ","))
+
+	rows, err := q.db.Query(query, args...)
+	if err != nil {
+		slog.Error("Failed to query verification progress", "error", err)
+		return nil
+	}
+	defer func() { _ = rows.Close() }()
+
+	var covered []string
+	for rows.Next() {
+		var id string
+		var total, verified int
+		if err := rows.Scan(&id, &total, &verified); err != nil {
+			slog.Error("Failed to scan verification progress row", "error", err)
+			return covered
+		}
+		if i, ok := indexByID[id]; ok && total > 0 {
+			items[i].TotalArticles = &total
+			items[i].VerifiedArticles = &verified
+			covered = append(covered, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		slog.Error("Failed to iterate verification progress rows", "error", err)
+	}
+	return covered
 }
 
 // buildOrderByClause constructs SQL ORDER BY clause
@@ -447,7 +790,8 @@ func (q *Queue) getMergedItemsPaginated(orderBy string, offset, limit int) ([]Qu
 	query := fmt.Sprintf(`
 		SELECT id, path, size, priority, status, retry_count, error_message,
 		       created_at, updated_at, completed_at, nzb_path, file_name,
-		       script_status, script_retry_count, script_last_error, script_next_retry_at
+		       script_status, script_retry_count, script_last_error, script_next_retry_at,
+		       verification_status
 		FROM (
 			-- Active queue items
 			SELECT id,
@@ -465,9 +809,32 @@ func (q *Queue) getMergedItemsPaginated(orderBy string, offset, limit int) ([]Qu
 				   NULL as script_status,
 				   0 as script_retry_count,
 				   NULL as script_last_error,
-				   NULL as script_next_retry_at
+				   NULL as script_next_retry_at,
+				   NULL as verification_status
 			FROM goqite
 			WHERE queue = 'file_jobs'
+
+			UNION ALL
+
+			-- In-progress items (currently being processed)
+			SELECT id,
+				   path as path,
+				   size,
+				   priority,
+				   'running' as status,
+				   json_extract(job_data, '$.retryCount') as retry_count,
+				   NULL as error_message,
+				   created_at,
+				   started_at as updated_at,
+				   NULL as completed_at,
+				   NULL as nzb_path,
+				   path as file_name,
+				   NULL as script_status,
+				   0 as script_retry_count,
+				   NULL as script_last_error,
+				   NULL as script_next_retry_at,
+				   NULL as verification_status
+			FROM in_progress_items
 
 			UNION ALL
 
@@ -476,7 +843,8 @@ func (q *Queue) getMergedItemsPaginated(orderBy string, offset, limit int) ([]Qu
 				   0 as retry_count, NULL as error_message,
 				   created_at, completed_at as updated_at, completed_at, nzb_path,
 				   path as file_name,
-				   script_status, script_retry_count, script_last_error, script_next_retry_at
+				   script_status, script_retry_count, script_last_error, script_next_retry_at,
+				   verification_status
 			FROM completed_items
 
 			UNION ALL
@@ -490,7 +858,8 @@ func (q *Queue) getMergedItemsPaginated(orderBy string, offset, limit int) ([]Qu
 				   NULL as script_status,
 				   0 as script_retry_count,
 				   NULL as script_last_error,
-				   NULL as script_next_retry_at
+				   NULL as script_next_retry_at,
+				   NULL as verification_status
 			FROM errored_items
 		)
 		ORDER BY %s
@@ -509,6 +878,7 @@ func (q *Queue) getMergedItemsPaginated(orderBy string, offset, limit int) ([]Qu
 		var item QueueItem
 		var completedAtStr, nzbPathStr, errorMsgStr sql.NullString
 		var scriptStatusStr, scriptLastErrorStr, scriptNextRetryAtStr sql.NullString
+		var verificationStatusStr sql.NullString
 		var createdAtStr, updatedAtStr string
 
 		err := rows.Scan(
@@ -516,6 +886,7 @@ func (q *Queue) getMergedItemsPaginated(orderBy string, offset, limit int) ([]Qu
 			&item.RetryCount, &errorMsgStr, &createdAtStr, &updatedAtStr,
 			&completedAtStr, &nzbPathStr, &item.FileName,
 			&scriptStatusStr, &item.ScriptRetryCount, &scriptLastErrorStr, &scriptNextRetryAtStr,
+			&verificationStatusStr,
 		)
 		if err != nil {
 			continue // Skip invalid rows
@@ -552,6 +923,9 @@ func (q *Queue) getMergedItemsPaginated(orderBy string, offset, limit int) ([]Qu
 		if scriptLastErrorStr.Valid {
 			item.ScriptLastError = &scriptLastErrorStr.String
 		}
+		if verificationStatusStr.Valid {
+			item.VerificationStatus = &verificationStatusStr.String
+		}
 
 		// Extract filename from path if needed
 		if item.FileName == "" {
@@ -569,9 +943,9 @@ func (q *Queue) getMergedItemsPaginated(orderBy string, offset, limit int) ([]Qu
 // getMergedItemsByStatus gets items sorted by status priority
 func (q *Queue) getMergedItemsByStatus(order string, offset, limit int) ([]QueueItem, error) {
 	// Define status priority order
-	statusOrder := []string{"pending", "error", "complete"}
+	statusOrder := []string{"running", "pending", "error", "complete"}
 	if order == "asc" {
-		statusOrder = []string{"complete", "error", "pending"}
+		statusOrder = []string{"complete", "error", "pending", "running"}
 	}
 
 	var allItems []QueueItem
@@ -583,10 +957,22 @@ func (q *Queue) getMergedItemsByStatus(order string, offset, limit int) ([]Queue
 			break
 		}
 
-		var items []QueueItem
-		var err error
+		// The offset must be consumed against the bucket's total size, not the
+		// page it returns: a bucket smaller than the offset returns nothing,
+		// and reducing by that empty page would skip items at the boundary.
+		count, err := q.countItemsByStatus(status)
+		if err != nil {
+			return nil, err
+		}
+		if currentOffset >= count {
+			currentOffset -= count
+			continue
+		}
 
+		var items []QueueItem
 		switch status {
+		case "running":
+			items, err = q.getInProgressItemsPaginated("started_at DESC", currentOffset, remaining)
 		case "pending":
 			items, err = q.getActiveItemsPaginated(currentOffset, remaining)
 		case "complete":
@@ -594,24 +980,85 @@ func (q *Queue) getMergedItemsByStatus(order string, offset, limit int) ([]Queue
 		case "error":
 			items, err = q.getErroredItemsPaginated(currentOffset, remaining)
 		}
-
 		if err != nil {
 			return nil, err
 		}
-
-		// Adjust offset for next category
-		if len(items) < currentOffset {
-			currentOffset -= len(items)
-			continue
-		}
 		currentOffset = 0
 
-		// Add items and reduce remaining count
 		allItems = append(allItems, items...)
 		remaining -= len(items)
 	}
 
 	return allItems, nil
+}
+
+// countItemsByStatus returns the number of items in the table backing status.
+func (q *Queue) countItemsByStatus(status string) (int, error) {
+	var query string
+	switch status {
+	case "running":
+		query = "SELECT COUNT(*) FROM in_progress_items"
+	case "pending":
+		query = "SELECT COUNT(*) FROM goqite WHERE queue = 'file_jobs'"
+	case "complete":
+		query = "SELECT COUNT(*) FROM completed_items"
+	case "error":
+		query = "SELECT COUNT(*) FROM errored_items"
+	default:
+		return 0, fmt.Errorf("unknown status %q", status)
+	}
+
+	var count int
+	if err := q.db.QueryRow(query).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count %s items: %w", status, err)
+	}
+	return count, nil
+}
+
+// getInProgressItemsPaginated returns paginated in-progress items
+func (q *Queue) getInProgressItemsPaginated(orderBy string, offset, limit int) ([]QueueItem, error) {
+	query := fmt.Sprintf(`
+		SELECT id, path, size, priority, created_at, started_at, job_data
+		FROM in_progress_items
+		ORDER BY %s
+		LIMIT ? OFFSET ?`, orderBy)
+
+	rows, err := q.db.Query(query, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query in-progress items: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var items []QueueItem
+	for rows.Next() {
+		var id, path, createdStr, startedStr string
+		var size, priority int64
+		var jobData []byte
+
+		if err := rows.Scan(&id, &path, &size, &priority, &createdStr, &startedStr, &jobData); err != nil {
+			continue
+		}
+
+		item := QueueItem{
+			ID:       id,
+			Path:     path,
+			FileName: path,
+			Size:     size,
+			Priority: int(priority),
+			Status:   StatusRunning,
+		}
+
+		if createdTime, err := time.Parse("2006-01-02T15:04:05.000Z", createdStr); err == nil {
+			item.CreatedAt = createdTime
+		}
+		if startedTime, err := time.Parse("2006-01-02T15:04:05.000Z", startedStr); err == nil {
+			item.UpdatedAt = startedTime
+		}
+
+		items = append(items, item)
+	}
+
+	return items, nil
 }
 
 // Helper methods for getting items from specific tables
@@ -667,7 +1114,8 @@ func (q *Queue) getActiveItemsPaginated(offset, limit int) ([]QueueItem, error) 
 func (q *Queue) getCompletedItemsPaginated(offset, limit int) ([]QueueItem, error) {
 	rows, err := q.db.Query(`
 		SELECT id, path, size, priority, nzb_path, created_at, completed_at,
-		       script_status, script_retry_count, script_last_error, script_next_retry_at
+		       script_status, script_retry_count, script_last_error, script_next_retry_at,
+		       verification_status
 		FROM completed_items
 		ORDER BY completed_at DESC
 		LIMIT ? OFFSET ?`, limit, offset)
@@ -682,11 +1130,13 @@ func (q *Queue) getCompletedItemsPaginated(offset, limit int) ([]QueueItem, erro
 	for rows.Next() {
 		var id, path, nzbPath, createdAt, completedAt string
 		var scriptStatusStr, scriptLastErrorStr, scriptNextRetryAtStr sql.NullString
+		var verificationStatusStr sql.NullString
 		var size int64
 		var priority, scriptRetryCount int
 
 		if err := rows.Scan(&id, &path, &size, &priority, &nzbPath, &createdAt, &completedAt,
-			&scriptStatusStr, &scriptRetryCount, &scriptLastErrorStr, &scriptNextRetryAtStr); err != nil {
+			&scriptStatusStr, &scriptRetryCount, &scriptLastErrorStr, &scriptNextRetryAtStr,
+			&verificationStatusStr); err != nil {
 			continue
 		}
 
@@ -719,6 +1169,9 @@ func (q *Queue) getCompletedItemsPaginated(offset, limit int) ([]QueueItem, erro
 			if nextRetryTime, err := time.Parse("2006-01-02T15:04:05.000Z", scriptNextRetryAtStr.String); err == nil {
 				item.ScriptNextRetryAt = &nextRetryTime
 			}
+		}
+		if verificationStatusStr.Valid {
+			item.VerificationStatus = &verificationStatusStr.String
 		}
 
 		items = append(items, item)
@@ -783,8 +1236,10 @@ func (q *Queue) getPendingItemsPaginated(orderBy string, offset, limit int) ([]Q
 	// Map column names for goqite table (which uses JSON body)
 	var sortColumn string
 	switch orderBy {
-	case "created_at DESC", "created_at ASC":
-		sortColumn = orderBy
+	case "created_at DESC":
+		sortColumn = "created DESC"
+	case "created_at ASC":
+		sortColumn = "created ASC"
 	case "size DESC":
 		sortColumn = "CAST(json_extract(body, '$.size') AS INTEGER) DESC"
 	case "size ASC":
@@ -855,7 +1310,8 @@ func (q *Queue) getPendingItemsPaginated(orderBy string, offset, limit int) ([]Q
 func (q *Queue) getCompletedItemsPaginatedWithSort(orderBy string, offset, limit int) ([]QueueItem, error) {
 	query := fmt.Sprintf(`
 		SELECT id, path, size, priority, nzb_path, created_at, completed_at,
-		       script_status, script_retry_count, script_last_error, script_next_retry_at
+		       script_status, script_retry_count, script_last_error, script_next_retry_at,
+		       verification_status
 		FROM completed_items
 		ORDER BY %s
 		LIMIT ? OFFSET ?`, orderBy)
@@ -872,11 +1328,13 @@ func (q *Queue) getCompletedItemsPaginatedWithSort(orderBy string, offset, limit
 	for rows.Next() {
 		var id, path, nzbPath, createdAt, completedAt string
 		var scriptStatusStr, scriptLastErrorStr, scriptNextRetryAtStr sql.NullString
+		var verificationStatusStr sql.NullString
 		var size int64
 		var priority, scriptRetryCount int
 
 		if err := rows.Scan(&id, &path, &size, &priority, &nzbPath, &createdAt, &completedAt,
-			&scriptStatusStr, &scriptRetryCount, &scriptLastErrorStr, &scriptNextRetryAtStr); err != nil {
+			&scriptStatusStr, &scriptRetryCount, &scriptLastErrorStr, &scriptNextRetryAtStr,
+			&verificationStatusStr); err != nil {
 			continue
 		}
 
@@ -908,6 +1366,9 @@ func (q *Queue) getCompletedItemsPaginatedWithSort(orderBy string, offset, limit
 			if nextRetryTime, err := time.Parse("2006-01-02T15:04:05.000Z", scriptNextRetryAtStr.String); err == nil {
 				item.ScriptNextRetryAt = &nextRetryTime
 			}
+		}
+		if verificationStatusStr.Valid {
+			item.VerificationStatus = &verificationStatusStr.String
 		}
 
 		items = append(items, item)
@@ -995,6 +1456,20 @@ func (q *Queue) RemoveFromQueue(id string) error {
 		return q.RemoveErroredItem(id)
 	}
 
+	// Check if the item is in-progress (delete from tracking table; job will be lost)
+	err = q.db.QueryRow("SELECT EXISTS(SELECT 1 FROM in_progress_items WHERE id = ?)", id).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("failed to check in-progress items: %w", err)
+	}
+
+	if exists {
+		_, err = q.db.Exec("DELETE FROM in_progress_items WHERE id = ?", id)
+		if err != nil {
+			return fmt.Errorf("failed to remove in-progress item: %w", err)
+		}
+		return nil
+	}
+
 	// If not found in completed or errored items, try to remove from active queue
 	return q.queue.Delete(q.runCtx, goqite.ID(id))
 }
@@ -1011,6 +1486,16 @@ func (q *Queue) RemoveCompletedItem(id string) error {
 		return fmt.Errorf("failed to get NZB path: %w", err)
 	}
 
+	// Delete dependent article checks first (FK constraint)
+	_, err = q.db.Exec("DELETE FROM pending_article_checks WHERE completed_item_id = ?", id)
+	if err != nil {
+		return fmt.Errorf("failed to delete pending article checks: %w", err)
+	}
+
+	if err := q.detachTransfers("completed_item_id = ?", id); err != nil {
+		return err
+	}
+
 	// Delete the database record
 	_, err = q.db.Exec("DELETE FROM completed_items WHERE id = ?", id)
 	if err != nil {
@@ -1023,6 +1508,59 @@ func (q *Queue) RemoveCompletedItem(id string) error {
 		// Don't return error here as the database record is already deleted
 	}
 
+	return nil
+}
+
+// detachTransfers removes the durable transfer rows (and their verification
+// failures and manifests) selected by the transfer_files WHERE clause. Called
+// when the completed items they belong to are removed by the user: the
+// background verification must stop for them, and above all the
+// post-verification cleaner must never delete originals for an upload whose
+// NZB the user has just thrown away.
+func (q *Queue) detachTransfers(where string, arg any) error {
+	var args []any
+	if arg != nil {
+		args = append(args, arg)
+	}
+
+	rows, err := q.db.Query("SELECT DISTINCT transfer_id, manifest_path FROM transfer_files WHERE "+where, args...)
+	if err != nil {
+		return fmt.Errorf("failed to list transfer files: %w", err)
+	}
+	transferIDs := make(map[string]struct{})
+	manifests := make(map[string]string)
+	for rows.Next() {
+		var transferID, manifestPath string
+		if err := rows.Scan(&transferID, &manifestPath); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("failed to scan transfer file: %w", err)
+		}
+		transferIDs[transferID] = struct{}{}
+		manifests[manifestPath] = transferID
+	}
+	// Close before writing: with a single SQLite connection an open cursor
+	// would block the deletes below.
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("failed to close transfer files cursor: %w", err)
+	}
+
+	for transferID := range transferIDs {
+		if _, err := q.db.Exec("DELETE FROM verification_failures WHERE transfer_id = ?", transferID); err != nil {
+			return fmt.Errorf("failed to delete verification failures for %s: %w", transferID, err)
+		}
+		if _, err := q.db.Exec("DELETE FROM transfer_files WHERE transfer_id = ?", transferID); err != nil {
+			return fmt.Errorf("failed to delete transfer files for %s: %w", transferID, err)
+		}
+	}
+
+	for path, transferID := range manifests {
+		if path == "" {
+			continue
+		}
+		if err := manifest.Remove(path, transferID); err != nil {
+			slog.Warn("Failed to remove manifest of detached transfer", "path", path, "error", err)
+		}
+	}
 	return nil
 }
 
@@ -1057,6 +1595,16 @@ func (q *Queue) ClearQueue() error {
 			continue
 		}
 		nzbPaths = append(nzbPaths, nzbPath)
+	}
+
+	// Clear pending article checks first (FK constraint)
+	_, err = q.db.Exec("DELETE FROM pending_article_checks")
+	if err != nil {
+		return err
+	}
+
+	if err := q.detachTransfers("completed_item_id IS NOT NULL", nil); err != nil {
+		return err
 	}
 
 	// Clear completed items from database
@@ -1105,6 +1653,16 @@ func (q *Queue) ClearCompletedItems() error {
 		nzbPaths = append(nzbPaths, nzbPath)
 	}
 
+	// Clear pending article checks first (FK constraint)
+	_, err = q.db.Exec("DELETE FROM pending_article_checks")
+	if err != nil {
+		return err
+	}
+
+	if err := q.detachTransfers("completed_item_id IS NOT NULL", nil); err != nil {
+		return err
+	}
+
 	// Clear completed items from database
 	_, err = q.db.Exec("DELETE FROM completed_items")
 	if err != nil {
@@ -1122,8 +1680,8 @@ func (q *Queue) ClearCompletedItems() error {
 }
 
 // GetQueueStats returns statistics about the queue including completed and errored items
-func (q *Queue) GetQueueStats() (map[string]interface{}, error) {
-	stats := make(map[string]interface{})
+func (q *Queue) GetQueueStats() (map[string]any, error) {
+	stats := make(map[string]any)
 
 	// Get total pending count (all items in queue are pending)
 	var pending int
@@ -1132,10 +1690,16 @@ func (q *Queue) GetQueueStats() (map[string]interface{}, error) {
 		return nil, err
 	}
 	stats["pending"] = pending
-	stats["total"] = pending
+	stats["total"] = pending // updated below to include running
 
-	// Running count is handled by processor, not queue
-	stats["running"] = 0
+	// Count items currently being processed
+	var running int
+	err = q.db.QueryRow("SELECT COUNT(*) FROM in_progress_items").Scan(&running)
+	if err == nil {
+		stats["running"] = running
+	} else {
+		stats["running"] = 0
+	}
 
 	// Count completed items
 	var complete int
@@ -1155,8 +1719,28 @@ func (q *Queue) GetQueueStats() (map[string]interface{}, error) {
 		stats["error"] = 0
 	}
 
+	// Count completed items by durable verification status (issue #184).
+	var pendingVerification int
+	if err := q.db.QueryRow("SELECT COUNT(*) FROM completed_items WHERE verification_status = 'pending_verification'").Scan(&pendingVerification); err == nil {
+		stats["pendingVerification"] = pendingVerification
+	} else {
+		stats["pendingVerification"] = 0
+	}
+
+	var verificationFailed int
+	if err := q.db.QueryRow("SELECT COUNT(*) FROM completed_items WHERE verification_status = 'verification_failed'").Scan(&verificationFailed); err == nil {
+		stats["verificationFailed"] = verificationFailed
+	} else {
+		stats["verificationFailed"] = 0
+	}
+
+	// Update total to include running items
+	if r, ok := stats["running"].(int); ok {
+		stats["total"] = pending + r
+	}
+
 	// Add total including completed and errored
-	stats["total_including_completed"] = pending + complete + errorCount
+	stats["total_including_completed"] = pending + running + complete + errorCount
 
 	return stats, nil
 }
@@ -1188,6 +1772,15 @@ func (q *Queue) IsPathInQueue(path string) (bool, error) {
 	err = q.db.QueryRow("SELECT COUNT(*) FROM completed_items WHERE path = ?", path).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("failed to check completed items: %w", err)
+	}
+	if count > 0 {
+		return true, nil
+	}
+
+	// Check in-progress items
+	err = q.db.QueryRow("SELECT COUNT(*) FROM in_progress_items WHERE path = ?", path).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("failed to check in-progress items: %w", err)
 	}
 	if count > 0 {
 		return true, nil
@@ -1229,7 +1822,7 @@ func (q *Queue) GetCompletedItemNzbPath(id string) (string, error) {
 }
 
 // DebugQueueItem returns debug information about a specific queue item
-func (q *Queue) DebugQueueItem(id string) (map[string]interface{}, error) {
+func (q *Queue) DebugQueueItem(id string) (map[string]any, error) {
 	var received int
 	var timeout, created, updated string
 	var body []byte
@@ -1252,7 +1845,7 @@ func (q *Queue) DebugQueueItem(id string) (map[string]interface{}, error) {
 	now := time.Now()
 
 	// Check processor status
-	debug := map[string]interface{}{
+	debug := map[string]any{
 		"id":                id,
 		"received":          received,
 		"timeout":           timeout,
@@ -1282,6 +1875,18 @@ func (q *Queue) ReaddJob(ctx context.Context, job *FileJob) error {
 		Body:     jobData,
 		Priority: job.Priority,
 	})
+}
+
+// ClearInProgress removes the in-progress tracking row for the given message ID.
+// Call this when a retry is about to be re-queued under a new ID, otherwise the
+// old in_progress row leaks and the same path appears as duplicate UI entries
+// across the pending goqite row and the stale in_progress row.
+func (q *Queue) ClearInProgress(ctx context.Context, msgID goqite.ID) error {
+	_, err := q.db.ExecContext(ctx, "DELETE FROM in_progress_items WHERE id = ?", string(msgID))
+	if err != nil {
+		return fmt.Errorf("failed to clear in-progress item %s: %w", string(msgID), err)
+	}
+	return nil
 }
 
 // SetQueueItemPriority updates the priority of a pending queue item by id
@@ -1371,6 +1976,9 @@ func (q *Queue) MarkAsError(ctx context.Context, msgID goqite.ID, job *FileJob, 
 	if err != nil {
 		return fmt.Errorf("failed to insert errored item: %w", err)
 	}
+
+	// Remove from in-progress tracking now that it is recorded as an error
+	_, _ = q.db.ExecContext(ctx, "DELETE FROM in_progress_items WHERE id = ?", string(msgID))
 
 	return nil
 }
@@ -1563,7 +2171,7 @@ func (q *Queue) AddPendingArticleChecks(ctx context.Context, completedItemID str
 	if err != nil {
 		return fmt.Errorf("failed to prepare statement: %w", err)
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	for _, article := range articles {
 		nextRetry := article.NextRetryAt.Format("2006-01-02T15:04:05.000Z")
@@ -1591,7 +2199,7 @@ func (q *Queue) GetArticlesForCheck(ctx context.Context, limit int) ([]PendingAr
 	if err != nil {
 		return nil, fmt.Errorf("failed to query pending article checks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var items []PendingArticleCheck
 	for rows.Next() {

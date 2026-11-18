@@ -1,31 +1,36 @@
 <script lang="ts">
 import apiClient from "$lib/api/client";
 import { t } from "$lib/i18n";
+import { toastStore } from "$lib/stores/toast";
 import { onMount, onDestroy } from "svelte";
-import { Eye, Clock, FolderOpen, Calendar, AlertCircle } from "lucide-svelte";
+import { fade, fly, listFlip } from "$lib/motion";
+import { AlertCircle, RefreshCw } from "lucide-svelte";
 import { watcher } from "$lib/wailsjs/go/models";
 
-let watcherStatus = $state<watcher.WatcherStatusInfo>(new watcher.WatcherStatusInfo());
+let watcherStatuses = $state<watcher.WatcherStatusInfo[]>([]);
 let loading = $state(true);
 let error = $state<string>("");
+let scanning = $state(false);
 let statusCheckInterval: NodeJS.Timeout | null = null;
+
+// Whether any watcher is enabled
+let anyEnabled = $derived(watcherStatuses.some(s => s.enabled));
+let enabledStatuses = $derived(watcherStatuses.filter(s => s.enabled));
 
 // Format next run time for display
 function formatNextRun(nextRunISO: string): string {
   if (!nextRunISO) return "";
-  
+
   const nextRun = new Date(nextRunISO);
   const now = new Date();
   const diffMs = nextRun.getTime() - now.getTime();
-  
-  // If it's in the past or very soon, show "Soon"
+
   if (diffMs <= 0) return $t("dashboard.watcher.next_run_soon");
-  
-  // Format relative time
+
   const diffMinutes = Math.floor(diffMs / (1000 * 60));
   const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
   const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-  
+
   if (diffDays > 0) {
     return $t("dashboard.watcher.next_run_days", { values: { count: diffDays } });
   } else if (diffHours > 0) {
@@ -37,20 +42,21 @@ function formatNextRun(nextRunISO: string): string {
   }
 }
 
-// Format absolute time for tooltip
 function formatAbsoluteTime(nextRunISO: string): string {
   if (!nextRunISO) return "";
-  
-  const nextRun = new Date(nextRunISO);
-  return nextRun.toLocaleString();
+  return new Date(nextRunISO).toLocaleString();
 }
 
-// Check watcher status
+function getWatcherDisplayName(status: watcher.WatcherStatusInfo, index: number): string {
+  if (status.name) return status.name;
+  return $t("dashboard.watcher.watcher_number", { values: { n: index + 1 } });
+}
+
 async function checkWatcherStatus() {
   try {
     loading = true;
     error = "";
-    watcherStatus = await apiClient.getWatcherStatus();
+    watcherStatuses = await apiClient.getWatcherStatus();
   } catch (err) {
     error = String(err);
     console.error("Failed to get watcher status:", err);
@@ -59,10 +65,24 @@ async function checkWatcherStatus() {
   }
 }
 
-// Setup periodic status checks
+async function handleScanNow() {
+  try {
+    scanning = true;
+    await apiClient.triggerScan();
+    toastStore.success(
+      $t("dashboard.watcher.scan_triggered"),
+      $t("dashboard.watcher.scan_triggered_description")
+    );
+  } catch (err) {
+    console.error("Failed to trigger scan:", err);
+    toastStore.error("Error", String(err));
+  } finally {
+    scanning = false;
+  }
+}
+
 onMount(async () => {
   await checkWatcherStatus();
-  // Check status every 30 seconds
   statusCheckInterval = setInterval(checkWatcherStatus, 30000);
 });
 
@@ -74,79 +94,68 @@ onDestroy(() => {
 });
 </script>
 
-<!-- Only show if watcher is enabled -->
-{#if watcherStatus.enabled}
-  <div class="card bg-base-100/60 backdrop-blur-sm border border-base-300/60 shadow-lg">
-    <div class="card-body p-4">
-      <div class="flex items-center gap-3 mb-3">
-        <Eye class="w-5 h-5 text-primary" />
-        <h3 class="text-lg font-semibold text-base-content">
-          {$t("dashboard.watcher.title")}
-        </h3>
-        
-        <!-- Status indicator -->
+{#if anyEnabled}
+  <section in:fade out:fade>
+    <div class="flex items-center justify-between mb-2">
+      <div class="flex items-center gap-2">
+        <div class="section-label !m-0">{$t("dashboard.watcher.title")}</div>
         {#if loading}
-          <div class="loading loading-spinner loading-xs"></div>
+          <span class="loading loading-spinner loading-xs"></span>
         {:else if error}
-          <AlertCircle class="w-4 h-4 text-error"/>
-        {:else if watcherStatus.initialized}
-          <div class="w-2 h-2 bg-success rounded-full animate-pulse" 
-               title={$t("dashboard.watcher.status_active")}></div>
-        {:else}
-          <div class="w-2 h-2 bg-warning rounded-full" 
-               title={$t("dashboard.watcher.status_inactive")}></div>
+          <AlertCircle class="w-4 h-4 text-error" />
         {/if}
       </div>
-
-      {#if error}
-        <div class="text-sm text-error">
-          {$t("dashboard.watcher.error_loading")}
-        </div>
-      {:else if !loading}
-        <div class="space-y-2 text-sm">
-          <!-- Watch Directory -->
-          <div class="flex items-center gap-2 text-base-content/80">
-            <FolderOpen class="w-4 h-4 text-base-content/60" />
-            <span class="truncate" title={watcherStatus.watch_directory}>
-              {watcherStatus.watch_directory || $t("dashboard.watcher.no_directory")}
-            </span>
-          </div>
-
-          <!-- Next Run Time -->
-          {#if watcherStatus.next_run && watcherStatus.initialized}
-            <div class="flex items-center gap-2 text-base-content/80">
-              <Clock class="w-4 h-4 text-base-content/60" />
-              <span title={formatAbsoluteTime(watcherStatus.next_run)}>
-                {$t("dashboard.watcher.next_scan")}: {formatNextRun(watcherStatus.next_run)}
-              </span>
-            </div>
-          {/if}
-
-          <!-- Schedule Info -->
-          {#if watcherStatus.schedule}
-            <div class="flex items-center gap-2 text-base-content/60 text-xs">
-              <Calendar class="w-3 h-3" />
-              <span>
-                {$t("dashboard.watcher.schedule")}: {watcherStatus.schedule.start_time} - {watcherStatus.schedule.end_time}
-              </span>
-              {#if !watcherStatus.is_within_schedule}
-                <span class="text-warning">({$t("dashboard.watcher.outside_schedule")})</span>
-              {/if}
-            </div>
-          {/if}
-
-          <!-- Status Messages -->
-          {#if !watcherStatus.initialized}
-            <div class="text-xs text-warning">
-              {$t("dashboard.watcher.not_initialized")}
-            </div>
-          {:else if !watcherStatus.is_within_schedule}
-            <div class="text-xs text-info">
-              {$t("dashboard.watcher.waiting_for_schedule")}
-            </div>
-          {/if}
-        </div>
-      {/if}
+      <button
+        type="button"
+        class="btn btn-xs btn-ghost gap-1"
+        onclick={handleScanNow}
+        disabled={scanning || watcherStatuses.every(s => !s.initialized)}
+        title={$t("dashboard.watcher.scan_now")}
+      >
+        <RefreshCw class="w-3.5 h-3.5 {scanning ? 'animate-spin' : ''}" />
+        {$t("dashboard.watcher.scan_now")}
+      </button>
     </div>
-  </div>
+
+    {#if error}
+      <div class="text-sm text-error">{$t("dashboard.watcher.error_loading")}</div>
+    {:else if !loading || watcherStatuses.length > 0}
+      <div class="settings-group">
+        {#each enabledStatuses as status, i (status.watch_directory || i)}
+          <div class="settings-row !items-start" in:fly out:fade animate:listFlip>
+            <div class="flex items-start gap-2.5 min-w-0">
+              <span
+                class="size-2 rounded-full shrink-0 mt-1.5 {status.initialized ? 'bg-success' : 'bg-warning'}"
+                title={status.initialized ? $t("dashboard.watcher.status_active") : $t("dashboard.watcher.status_inactive")}
+              ></span>
+              <div class="min-w-0">
+                <div class="settings-row-title text-sm">{getWatcherDisplayName(status, i)}</div>
+                <div class="settings-row-desc truncate" title={status.watch_directory}>
+                  {status.watch_directory || $t("dashboard.watcher.no_directory")}
+                </div>
+                {#if status.schedule}
+                  <div class="settings-row-desc tabular-nums">
+                    {$t("dashboard.watcher.schedule")}: {status.schedule.start_time} - {status.schedule.end_time}
+                    {#if !status.is_within_schedule}
+                      <span class="text-warning-ink">({$t("dashboard.watcher.outside_schedule")})</span>
+                    {/if}
+                  </div>
+                {/if}
+                {#if !status.initialized}
+                  <div class="text-xs text-warning-ink">{$t("dashboard.watcher.not_initialized")}</div>
+                {:else if !status.is_within_schedule}
+                  <div class="text-xs text-base-content/60">{$t("dashboard.watcher.waiting_for_schedule")}</div>
+                {/if}
+              </div>
+            </div>
+            {#if status.next_run && status.initialized}
+              <div class="text-xs text-base-content/60 text-right shrink-0 tabular-nums" title={formatAbsoluteTime(status.next_run)}>
+                {$t("dashboard.watcher.next_scan")}: {formatNextRun(status.next_run)}
+              </div>
+            {/if}
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </section>
 {/if}

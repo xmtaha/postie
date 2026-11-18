@@ -25,7 +25,7 @@ Start Postie using Docker or the binary:
 **Docker:**
 
 ```bash
-docker run -p 8080:8080 -v $(pwd)/config:/config -v $(pwd)/output:/output javi11/postie
+docker run -p 8080:8080 -v $(pwd)/config:/config -v $(pwd)/output:/output kipsilabs/postie
 ```
 
 **Binary:**
@@ -79,7 +79,8 @@ posting:
   retry_delay: 5s
   article_size_in_bytes: 750000 # ~750KB per article
   groups:
-    - alt.binaries.test
+    - name: alt.binaries.test
+      enabled: true
   obfuscation_policy: full # Options: full, partial, none
 
 post_check:
@@ -91,8 +92,6 @@ output_dir: "./output"
 ```
 
 Save this file and start Postie with: `./postie -config config.yaml`
-
-**💡 Note**: Even with manual configuration, we recommend using the web interface for uploading and monitoring, as it provides a much better user experience.
 
 **💡 Note**: Even with manual configuration, we recommend using the web interface for uploading and monitoring, as it provides a much better user experience.
 
@@ -115,6 +114,15 @@ To post all files in a directory:
 ```bash
 ./postie -config config.yaml -d /path/to/directory -o ./output
 ```
+
+To skip temporary files, repeat `--ignore-pattern` for each quoted glob:
+
+```bash
+./postie -c config.yaml -d /path/to/directory -o ./output \
+  --ignore-pattern '*.tmp' --ignore-pattern '*.part' --ignore-pattern '*.!ut'
+```
+
+Patterns match file basenames, including files in subdirectories. Directory names are not filtered. Without these flags, all files are included. An explicit `-i` file takes precedence and ignores these patterns. See [command line parameters](./configuration#command-line-parameters) for details.
 
 ### Watch Mode
 

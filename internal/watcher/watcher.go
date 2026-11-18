@@ -7,13 +7,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/javi11/postie/internal/config"
-	"github.com/javi11/postie/internal/queue"
-	"github.com/opencontainers/selinux/pkg/pwalkdir"
+	"github.com/kipsilabs/postie/internal/config"
+	"github.com/kipsilabs/postie/internal/queue"
 )
 
 // WatcherScheduleInfo represents the schedule configuration
@@ -24,6 +24,7 @@ type WatcherScheduleInfo struct {
 
 // WatcherStatusInfo represents the watcher status information
 type WatcherStatusInfo struct {
+	Name             string               `json:"name"`
 	Enabled          bool                 `json:"enabled"`
 	Initialized      bool                 `json:"initialized"`
 	WatchDirectory   string               `json:"watch_directory"`
@@ -155,33 +156,7 @@ func (w *Watcher) scanDirectory(ctx context.Context) error {
 	}
 
 	// Process all files in directory (traditional mode - one NZB per file)
-	return pwalkdir.Walk(w.watchFolder, func(path string, dir fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip directories
-		if dir.IsDir() {
-			return nil
-		}
-
-		// Check if the path is a symlink and skip if not following symlinks
-		if !w.cfg.FollowSymlinks {
-			isSymlinkFile, err := isSymlink(path)
-			if err != nil {
-				slog.DebugContext(ctx, "Error checking if path is symlink, skipping", "path", path, "error", err)
-				return nil
-			}
-			if isSymlinkFile {
-				slog.DebugContext(ctx, "Skipping symlink", "path", path)
-				return nil
-			}
-		}
-
-		info, err := dir.Info()
-		if err != nil {
-			return err
-		}
+	return w.walkFiles(ctx, func(path string, info os.FileInfo) error {
 
 		slog.DebugContext(ctx, "Processing file", "path", path, "size", info.Size(), "mod_time", info.ModTime())
 
@@ -210,8 +185,10 @@ func (w *Watcher) scanDirectory(ctx context.Context) error {
 			return nil
 		}
 
-		// Add file to queue - no need for duplicate checking since we already checked above
-		err = w.queue.AddFile(ctx, path, info.Size())
+		// Add file to queue with this watcher's root so the processor derives the
+		// relative output path from the correct watch folder (issue #168: only the
+		// first configured watcher's root was known to the processor).
+		err = w.queue.AddFileWithOptions(ctx, path, info.Size(), queue.AddOptions{InputFolder: w.watchFolder})
 
 		if err != nil {
 			slog.ErrorContext(ctx, "Error adding file to queue", "path", path, "error", err)
@@ -226,53 +203,37 @@ func (w *Watcher) scanDirectory(ctx context.Context) error {
 
 // scanDirectoryGroupByFolder scans the directory and groups files by folder for single NZB per folder mode
 func (w *Watcher) scanDirectoryGroupByFolder(ctx context.Context) error {
-	// Map to collect files by their parent directory
+	// Map to collect files by their top-level subdirectory under the watch folder
 	filesByFolder := make(map[string][]string)
 	sizeByFolder := make(map[string]int64)
+	individualFiles := make(map[string]int64)
 	var mapMutex sync.Mutex
 
 	// Walk the directory tree and collect files by folder
-	err := pwalkdir.Walk(w.watchFolder, func(path string, dir fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip directories
-		if dir.IsDir() {
-			return nil
-		}
-
-		// Check if the path is a symlink and skip if not following symlinks
-		if !w.cfg.FollowSymlinks {
-			isSymlinkFile, err := isSymlink(path)
-			if err != nil {
-				slog.DebugContext(ctx, "Error checking if path is symlink, skipping", "path", path, "error", err)
-				return nil
-			}
-			if isSymlinkFile {
-				slog.DebugContext(ctx, "Skipping symlink", "path", path)
-				return nil
-			}
-		}
-
-		info, err := dir.Info()
-		if err != nil {
-			return err
-		}
+	err := w.walkFiles(ctx, func(path string, info os.FileInfo) error {
 
 		// Skip files that don't meet criteria
 		if !w.shouldProcessFile(path, info) {
 			return nil
 		}
 
-		// Get the parent directory
-		folderPath := filepath.Dir(path)
+		// Determine which top-level subdirectory this file belongs to
+		relPath, err := filepath.Rel(w.watchFolder, path)
+		if err != nil {
+			return err
+		}
+		parts := strings.SplitN(filepath.ToSlash(relPath), "/", 2)
 
-		// Add file to the folder's file list
 		mapMutex.Lock()
-		filesByFolder[folderPath] = append(filesByFolder[folderPath], path)
-		sizeByFolder[folderPath] += info.Size()
-
+		if len(parts) == 1 {
+			// File is directly in the watch folder — handle individually
+			individualFiles[path] = info.Size()
+		} else {
+			// File is inside a subdirectory — group under the top-level subdir
+			folderPath := filepath.Join(w.watchFolder, parts[0])
+			filesByFolder[folderPath] = append(filesByFolder[folderPath], path)
+			sizeByFolder[folderPath] += info.Size()
+		}
 		mapMutex.Unlock()
 		return nil
 	})
@@ -342,7 +303,7 @@ func (w *Watcher) scanDirectoryGroupByFolder(ctx context.Context) error {
 
 		// Add the folder to the queue with a special marker to indicate it's a folder
 		// folderQueuePath was already computed above with "FOLDER:" + folderPath prefix
-		err = w.queue.AddFile(ctx, folderQueuePath, folderSize)
+		err = w.queue.AddFileWithOptions(ctx, folderQueuePath, folderSize, queue.AddOptions{InputFolder: w.watchFolder})
 		if err != nil {
 			slog.ErrorContext(ctx, "Error adding folder to queue", "folder", folderPath, "error", err)
 			continue
@@ -356,7 +317,80 @@ func (w *Watcher) scanDirectoryGroupByFolder(ctx context.Context) error {
 		}
 	}
 
+	// Process files that are directly in the watch folder (not in any subdirectory)
+	for path, size := range individualFiles {
+		// Check if file is currently being processed
+		if w.processor != nil && w.processor.IsPathBeingProcessed(path) {
+			slog.InfoContext(ctx, "File is currently being processed, ignoring", "path", path)
+			continue
+		}
+
+		// Check if file is already in queue
+		inQueue, err := w.queue.IsPathInQueue(path)
+		if err != nil {
+			slog.ErrorContext(ctx, "Error checking if path is in queue", "path", path, "error", err)
+			continue
+		}
+
+		if inQueue {
+			slog.DebugContext(ctx, "File already exists in queue, ignoring", "path", path)
+			continue
+		}
+
+		if err := w.queue.AddFileWithOptions(ctx, path, size, queue.AddOptions{InputFolder: w.watchFolder}); err != nil {
+			slog.ErrorContext(ctx, "Error adding file to queue", "path", path, "error", err)
+			continue
+		}
+
+		slog.InfoContext(ctx, "Added file to queue", "path", filepath.Base(path), "size", size)
+	}
+
 	return nil
+}
+
+// walkFiles calls fn for every regular file under the watch folder, skipping
+// directories and (unless configured otherwise) symlinks. An entry that cannot
+// be read or stat'ed is logged and skipped rather than aborting the whole scan:
+// a single permission-denied subfolder, or a file removed between listing and
+// stat, must not stop every other file from being imported. Only an unreadable
+// watch folder root is an error.
+func (w *Watcher) walkFiles(ctx context.Context, fn func(path string, info os.FileInfo) error) error {
+	return filepath.WalkDir(w.watchFolder, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			if path == w.watchFolder {
+				return err
+			}
+			slog.WarnContext(ctx, "Skipping unreadable entry in watch folder", "path", path, "error", err)
+			if entry != nil && entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
+		if entry.IsDir() {
+			return nil
+		}
+
+		if !w.cfg.FollowSymlinks {
+			isSymlinkFile, err := isSymlink(path)
+			if err != nil {
+				slog.DebugContext(ctx, "Error checking if path is symlink, skipping", "path", path, "error", err)
+				return nil
+			}
+			if isSymlinkFile {
+				slog.DebugContext(ctx, "Skipping symlink", "path", path)
+				return nil
+			}
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			slog.DebugContext(ctx, "Skipping entry that could not be stat'ed", "path", path, "error", err)
+			return nil
+		}
+
+		return fn(path, info)
+	})
 }
 
 func (w *Watcher) shouldProcessFile(path string, info os.FileInfo) bool {
@@ -389,33 +423,7 @@ func (w *Watcher) shouldProcessFile(path string, info os.FileInfo) bool {
 func (w *Watcher) calculateDirectorySize(ctx context.Context) (int64, error) {
 	var totalSize int64
 
-	err := pwalkdir.Walk(w.watchFolder, func(path string, dir fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip directories
-		if dir.IsDir() {
-			return nil
-		}
-
-		// Check if the path is a symlink and skip if not following symlinks
-		if !w.cfg.FollowSymlinks {
-			isSymlinkFile, err := isSymlink(path)
-			if err != nil {
-				slog.DebugContext(ctx, "Error checking if path is symlink, skipping", "path", path, "error", err)
-				return nil
-			}
-			if isSymlinkFile {
-				slog.DebugContext(ctx, "Skipping symlink in size calculation", "path", path)
-				return nil
-			}
-		}
-
-		info, err := dir.Info()
-		if err != nil {
-			return err
-		}
+	err := w.walkFiles(ctx, func(path string, info os.FileInfo) error {
 
 		// Only count files that meet basic criteria (not ignore patterns and min file size)
 		if w.shouldCountFile(path, info) {
@@ -452,36 +460,20 @@ func (w *Watcher) shouldCountFile(path string, info os.FileInfo) bool {
 
 // isFileStable checks if a file is stable (not being written to) using multiple methods
 func (w *Watcher) isFileStable(path string, info os.FileInfo) bool {
-	// Method 1: Check if file modification time is older than 2 seconds
-	// This is the most reliable method for detecting actively written files
-	if time.Since(info.ModTime()) < 2*time.Second {
+	// Method 1: Check if file modification time is older than MinFileAge
+	minAge := w.cfg.MinFileAge.ToDuration()
+	if minAge == 0 {
+		minAge = 60 * time.Second // fallback if not configured
+	}
+	if time.Since(info.ModTime()) < minAge {
 		return false
 	}
 
-	// Method 2: Try to open the file exclusively to check if it's being used
-	// This detects files that are open for writing by other processes
-	if !w.canOpenFileExclusively(path) {
-		return false
-	}
-
-	// Method 3: Check file size stability by comparing current size with cached size
+	// Method 2: Check file size stability by comparing current size with cached size
 	// This detects files that are still growing
 	if !w.isFileSizeStable(path, info.Size()) {
 		return false
 	}
-
-	return true
-}
-
-// canOpenFileExclusively attempts to open the file in exclusive mode to detect if it's in use
-func (w *Watcher) canOpenFileExclusively(path string) bool {
-	file, err := os.OpenFile(path, os.O_RDONLY, 0)
-	if err != nil {
-		// If we can't open the file, assume it's being used
-		return false
-	}
-
-	_ = file.Close()
 
 	return true
 }
@@ -552,7 +544,7 @@ func (w *Watcher) ClearQueue() error {
 }
 
 // GetQueueStats returns statistics about the queue via queue
-func (w *Watcher) GetQueueStats() (map[string]interface{}, error) {
+func (w *Watcher) GetQueueStats() (map[string]any, error) {
 	return w.queue.GetQueueStats()
 }
 
@@ -638,6 +630,7 @@ func (w *Watcher) getNextScheduledRun(now time.Time) time.Time {
 // GetWatcherStatus returns comprehensive watcher status information
 func (w *Watcher) GetWatcherStatus() WatcherStatusInfo {
 	status := WatcherStatusInfo{
+		Name:             w.cfg.Name,
 		Enabled:          w.cfg.Enabled,
 		Initialized:      true, // If this method is called, the watcher is initialized
 		WatchDirectory:   w.watchFolder,

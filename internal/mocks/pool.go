@@ -12,7 +12,7 @@ package mocks
 import (
 	reflect "reflect"
 
-	nntppool "github.com/javi11/nntppool/v2"
+	pool "github.com/kipsilabs/postie/internal/pool"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -41,10 +41,10 @@ func (m *MockPoolManager) EXPECT() *MockPoolManagerMockRecorder {
 }
 
 // GetCheckPool mocks base method.
-func (m *MockPoolManager) GetCheckPool() nntppool.UsenetConnectionPool {
+func (m *MockPoolManager) GetCheckPool() pool.NNTPClient {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetCheckPool")
-	ret0, _ := ret[0].(nntppool.UsenetConnectionPool)
+	ret0, _ := ret[0].(pool.NNTPClient)
 	return ret0
 }
 
@@ -55,10 +55,10 @@ func (mr *MockPoolManagerMockRecorder) GetCheckPool() *gomock.Call {
 }
 
 // GetPool mocks base method.
-func (m *MockPoolManager) GetPool() nntppool.UsenetConnectionPool {
+func (m *MockPoolManager) GetPool() pool.NNTPClient {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetPool")
-	ret0, _ := ret[0].(nntppool.UsenetConnectionPool)
+	ret0, _ := ret[0].(pool.NNTPClient)
 	return ret0
 }
 
@@ -66,4 +66,32 @@ func (m *MockPoolManager) GetPool() nntppool.UsenetConnectionPool {
 func (mr *MockPoolManagerMockRecorder) GetPool() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetPool", reflect.TypeOf((*MockPoolManager)(nil).GetPool))
+}
+
+// GetUploadPool mocks base method.
+func (m *MockPoolManager) GetUploadPool() pool.NNTPClient {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetUploadPool")
+	ret0, _ := ret[0].(pool.NNTPClient)
+	return ret0
+}
+
+// GetUploadPool indicates an expected call of GetUploadPool.
+func (mr *MockPoolManagerMockRecorder) GetUploadPool() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetUploadPool", reflect.TypeOf((*MockPoolManager)(nil).GetUploadPool))
+}
+
+// GetVerifyPool mocks base method.
+func (m *MockPoolManager) GetVerifyPool() pool.NNTPClient {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetVerifyPool")
+	ret0, _ := ret[0].(pool.NNTPClient)
+	return ret0
+}
+
+// GetVerifyPool indicates an expected call of GetVerifyPool.
+func (mr *MockPoolManagerMockRecorder) GetVerifyPool() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetVerifyPool", reflect.TypeOf((*MockPoolManager)(nil).GetVerifyPool))
 }

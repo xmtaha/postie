@@ -18,12 +18,12 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Getting Started',
-      items: ['installation', 'quick-start'],
+      items: ['installation', 'quick-start', 'first-setup'],
     },
     {
       type: 'category',
       label: 'Configuration',
-      items: ['configuration', 'watcher'],
+      items: ['configuration', 'watcher', 'web-authentication'],
     },
     {
       type: 'category',
@@ -34,6 +34,11 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'File Hash',
       items: ['file-hash'],
+    },
+    {
+      type: 'category',
+      label: 'Performance',
+      items: ['benchmarks'],
     },
   ],
 };

@@ -8,15 +8,20 @@
 			"description": "Gérez vos téléchargements de fichiers et surveillez le progrès",
 			"add_files": "Ajouter des Fichiers",
 			"add_folder": "Ajouter un Dossier",
-			"add_folder_tooltip": "Télécharger un dossier entier comme un seul NZB",
+			"add_folder_tooltip": "Télécharger un ou plusieurs dossiers, chacun comme un seul NZB",
 			"folder_added": "Dossier Ajouté",
 			"folder_added_description": "Le dossier a été ajouté à la file d'attente de téléchargement",
+			"folders_added": "Dossiers Ajoutés",
+			"folders_added_description": "{{count}} dossiers ont été ajoutés à la file d'attente de téléchargement",
 			"import_files": "Importer des Fichiers",
 			"import_files_tooltip": "Explorer et importer des fichiers depuis le serveur distant",
 			"clear_completed": "Vider les Terminés"
 		},
 		"queue": {
+			"reused_nzb": "NZB réutilisé",
 			"title": "File d'Attente de Téléchargement",
+			"search_placeholder": "Rechercher un fichier…",
+			"search_within_page": "page actuelle uniquement",
 			"items": "éléments",
 			"total_size": "Taille Totale",
 			"nzb": "NZB",
@@ -53,17 +58,30 @@
 			"next": "Suivant",
 			"retry_all_failed": "Réessayer échoués",
 			"bulk_retry_success": "{count} éléments réessayés avec succès",
+			"delete_selected": "Supprimer la sélection ({count})",
+			"confirm_delete_selected": "Êtes-vous sûr de vouloir supprimer {count} éléments sélectionnés ? Cette action est irréversible.",
+			"batch_deleted": "{count} éléments supprimés de la file d'attente.",
 			"status_types": {
+				"completed": "Terminé",
 				"pending": "en attente",
 				"complete": "terminé",
 				"error": "erreur",
 				"waiting": "En attente",
 				"processing": "En traitement",
 				"failed": "Échoué"
-			}
+			},
+			"verification": {
+				"pending": "Vérification en cours",
+				"failed": "Vérification échouée",
+				"progress": "{verified} sur {total} vérifiés"
+			},
+			"duration": "Durée",
+			"processing_time": "Temps de traitement"
 		},
 		"progress": {
 			"title": "Progression de Téléchargement",
+			"file_size": "Taille du fichier",
+			"path": "Chemin",
 			"status": {
 				"active": "Actif",
 				"idle": "Inactif",
@@ -72,7 +90,8 @@
 			"task_status": {
 				"paused": "En Pause",
 				"in_progress": "En Cours",
-				"pending": "En Attente"
+				"pending": "En Attente",
+				"waiting": "En attente de propagation..."
 			},
 			"pause_processing": "Mettre en Pause le Traitement",
 			"resume_processing": "Reprendre le Traitement",
@@ -119,6 +138,10 @@
 				"successfully_finished": "Terminé avec succès",
 				"errors_detected": "Erreurs Détectées",
 				"failed_to_process": "Éléments qui ont échoué lors du traitement",
+				"pending_verification": "Vérification en attente",
+				"pending_verification_hint": "Mis en ligne ; en attente de vérification en arrière-plan",
+				"verification_failed": "Échec de la vérification",
+				"verification_failed_hint": "Certains articles n'ont pas pu être vérifiés ; les originaux sont conservés",
 				"failed_items": "Éléments échoués",
 				"queue_progress": "Progression de la File d'Attente",
 				"overall_completion": "État général d'achèvement",
@@ -137,6 +160,7 @@
 		"job_failed": "Échec du téléchargement: {fileName}",
 		"file_explorer": {
 			"title": "Ajouter des Fichiers du Serveur à la File",
+			"close": "Fermer",
 			"import_success": "Fichiers ajoutés à la file avec succès",
 			"no_files_selected": "Aucun fichier sélectionné",
 			"import_success_description": "{count} {count, plural, =1 {fichier ajouté} other {fichiers ajoutés}} à la file avec succès",
@@ -170,8 +194,25 @@
 			"active_connections": "connexions actives",
 			"total_uploaded": "Total Téléchargé",
 			"no_providers": "Aucun fournisseur configuré",
+			"avg_speed": "Vitesse Moyenne",
+			"missing": "Manquants",
+			"errors": "Erreurs",
+			"elapsed": "Disponibilité",
+			"total_errors": "Erreurs Totales",
+			"inflight": "Profondeur du pipeline",
+			"current_speed": "Vitesse Actuelle",
+			"ttfb": "TTFB",
+			"downloaded": "Téléchargé",
+			"uploaded": "Envoyé",
+			"upload_speed": "Vitesse d’envoi",
+			"avg_upload_speed": "Vitesse d’envoi moyenne",
+			"free_slots": "libres",
+			"quota": "Quota",
+			"quota_exceeded": "Dépassé",
+			"quota_resets": "Réinitialisation",
 			"status": {
 				"connected": "Connecté",
+				"idle": "Inactif",
 				"connecting": "Connexion",
 				"reconnecting": "Reconnexion",
 				"failed": "Échec",
@@ -193,7 +234,12 @@
 			"next_run_soon": "Bientôt",
 			"next_run_minutes": "dans {count} {count, plural, =1 {minute} other {minutes}}",
 			"next_run_hours": "dans {count} {count, plural, =1 {heure} other {heures}}",
-			"next_run_days": "dans {count} {count, plural, =1 {jour} other {jours}}"
+			"next_run_days": "dans {count} {count, plural, =1 {jour} other {jours}}",
+			"scan_now": "Scanner maintenant",
+			"scan_triggered": "Scan déclenché",
+			"scan_triggered_description": "Le scan du répertoire a été lancé",
+			"watcher_number": "Surveillant #{n}",
+			"no_watchers": "Aucun répertoire de surveillance configuré"
 		}
 	}
 }

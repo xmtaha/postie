@@ -1,5 +1,37 @@
 export namespace backend {
 	
+	export class APIQueueUploadRequest {
+	    file: string;
+	    relative_path: string;
+	    priority?: number;
+	    delete_after_upload?: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new APIQueueUploadRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.file = source["file"];
+	        this.relative_path = source["relative_path"];
+	        this.priority = source["priority"];
+	        this.delete_after_upload = source["delete_after_upload"];
+	    }
+	}
+	export class APIQueueUploadResult {
+	    status: string;
+	    file: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new APIQueueUploadResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.status = source["status"];
+	        this.file = source["file"];
+	    }
+	}
 	export class AppStatus {
 	    hasConfig: boolean;
 	    configPath: string;
@@ -35,15 +67,23 @@ export namespace backend {
 	    }
 	}
 	export class NntpProviderMetrics {
+	    name: string;
 	    host: string;
-	    state: string;
 	    activeConnections: number;
 	    maxConnections: number;
-	    totalBytesUploaded: number;
-	    totalBytesDownloaded: number;
-	    totalArticlesPosted: number;
-	    totalArticlesDownloaded: number;
+	    availableSlots: number;
 	    totalErrors: number;
+	    avgSpeed: number;
+	    speedEwma: number;
+	    bytesConsumed: number;
+	    missing: number;
+	    pingRTT: string;
+	    ttfb: string;
+	    inflight: number;
+	    quotaBytes: number;
+	    quotaUsed: number;
+	    quotaResetAt: string;
+	    quotaExceeded: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new NntpProviderMetrics(source);
@@ -51,25 +91,35 @@ export namespace backend {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
 	        this.host = source["host"];
-	        this.state = source["state"];
 	        this.activeConnections = source["activeConnections"];
 	        this.maxConnections = source["maxConnections"];
-	        this.totalBytesUploaded = source["totalBytesUploaded"];
-	        this.totalBytesDownloaded = source["totalBytesDownloaded"];
-	        this.totalArticlesPosted = source["totalArticlesPosted"];
-	        this.totalArticlesDownloaded = source["totalArticlesDownloaded"];
+	        this.availableSlots = source["availableSlots"];
 	        this.totalErrors = source["totalErrors"];
+	        this.avgSpeed = source["avgSpeed"];
+	        this.speedEwma = source["speedEwma"];
+	        this.bytesConsumed = source["bytesConsumed"];
+	        this.missing = source["missing"];
+	        this.pingRTT = source["pingRTT"];
+	        this.ttfb = source["ttfb"];
+	        this.inflight = source["inflight"];
+	        this.quotaBytes = source["quotaBytes"];
+	        this.quotaUsed = source["quotaUsed"];
+	        this.quotaResetAt = source["quotaResetAt"];
+	        this.quotaExceeded = source["quotaExceeded"];
 	    }
 	}
 	export class NntpPoolMetrics {
 	    timestamp: string;
 	    activeConnections: number;
-	    totalBytesUploaded: number;
-	    totalBytesDownloaded: number;
-	    totalArticlesPosted: number;
-	    totalArticlesDownloaded: number;
 	    totalErrors: number;
+	    avgSpeed: number;
+	    bytesConsumed: number;
+	    bytesUploaded: number;
+	    uploadSpeed: number;
+	    uploadAvgSpeed: number;
+	    elapsed: string;
 	    providerErrors: Record<string, number>;
 	    providers: NntpProviderMetrics[];
 	
@@ -81,11 +131,13 @@ export namespace backend {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.timestamp = source["timestamp"];
 	        this.activeConnections = source["activeConnections"];
-	        this.totalBytesUploaded = source["totalBytesUploaded"];
-	        this.totalBytesDownloaded = source["totalBytesDownloaded"];
-	        this.totalArticlesPosted = source["totalArticlesPosted"];
-	        this.totalArticlesDownloaded = source["totalArticlesDownloaded"];
 	        this.totalErrors = source["totalErrors"];
+	        this.avgSpeed = source["avgSpeed"];
+	        this.bytesConsumed = source["bytesConsumed"];
+	        this.bytesUploaded = source["bytesUploaded"];
+	        this.uploadSpeed = source["uploadSpeed"];
+	        this.uploadAvgSpeed = source["uploadAvgSpeed"];
+	        this.elapsed = source["elapsed"];
 	        this.providerErrors = source["providerErrors"];
 	        this.providers = this.convertValues(source["providers"], NntpProviderMetrics);
 	    }
@@ -125,6 +177,9 @@ export namespace backend {
 	    // Go type: time
 	    completedAt?: any;
 	    nzbPath?: string;
+	    verificationStatus?: string;
+	    verifiedArticles?: number;
+	    totalArticles?: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new QueueItem(source);
@@ -144,6 +199,9 @@ export namespace backend {
 	        this.updatedAt = this.convertValues(source["updatedAt"], null);
 	        this.completedAt = this.convertValues(source["completedAt"], null);
 	        this.nzbPath = source["nzbPath"];
+	        this.verificationStatus = source["verificationStatus"];
+	        this.verifiedArticles = source["verifiedArticles"];
+	        this.totalArticles = source["totalArticles"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -249,6 +307,8 @@ export namespace backend {
 	    running: number;
 	    complete: number;
 	    error: number;
+	    pendingVerification: number;
+	    verificationFailed: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new QueueStats(source);
@@ -261,15 +321,19 @@ export namespace backend {
 	        this.running = source["running"];
 	        this.complete = source["complete"];
 	        this.error = source["error"];
+	        this.pendingVerification = source["pendingVerification"];
+	        this.verificationFailed = source["verificationFailed"];
 	    }
 	}
 	export class ServerData {
+	    name: string;
 	    host: string;
 	    port: number;
 	    username: string;
 	    password: string;
 	    ssl: boolean;
 	    maxConnections: number;
+	    role: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new ServerData(source);
@@ -277,12 +341,14 @@ export namespace backend {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
 	        this.host = source["host"];
 	        this.port = source["port"];
 	        this.username = source["username"];
 	        this.password = source["password"];
 	        this.ssl = source["ssl"];
 	        this.maxConnections = source["maxConnections"];
+	        this.role = source["role"];
 	    }
 	}
 	export class SetupWizardData {
@@ -319,6 +385,38 @@ export namespace backend {
 		    return a;
 		}
 	}
+	export class TransferRuntimeMetrics {
+	    uploadActiveWorkers: number;
+	    uploadQueuedWorkers: number;
+	    uploadWorkerCount: number;
+	    uploadReservedBytes: number;
+	    uploadBudgetBytes: number;
+	    uploadBytes: number;
+	    uploadSpeedBps: number;
+	    uploadAvgSpeedBps: number;
+	    par2ActiveJobs: number;
+	    par2QueuedJobs: number;
+	    par2Capacity: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new TransferRuntimeMetrics(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.uploadActiveWorkers = source["uploadActiveWorkers"];
+	        this.uploadQueuedWorkers = source["uploadQueuedWorkers"];
+	        this.uploadWorkerCount = source["uploadWorkerCount"];
+	        this.uploadReservedBytes = source["uploadReservedBytes"];
+	        this.uploadBudgetBytes = source["uploadBudgetBytes"];
+	        this.uploadBytes = source["uploadBytes"];
+	        this.uploadSpeedBps = source["uploadSpeedBps"];
+	        this.uploadAvgSpeedBps = source["uploadAvgSpeedBps"];
+	        this.par2ActiveJobs = source["par2ActiveJobs"];
+	        this.par2QueuedJobs = source["par2QueuedJobs"];
+	        this.par2Capacity = source["par2Capacity"];
+	    }
+	}
 	export class ValidationResult {
 	    valid: boolean;
 	    error: string;
@@ -338,6 +436,93 @@ export namespace backend {
 
 export namespace config {
 	
+	export class APIConfig {
+	    enabled: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new APIConfig(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.enabled = source["enabled"];
+	    }
+	}
+	export class ArrInstance {
+	    id: string;
+	    name: string;
+	    type: string;
+	    url: string;
+	    api_key: string;
+	    enabled: boolean;
+	    webhook_id: number;
+	    delete_after_upload: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new ArrInstance(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.type = source["type"];
+	        this.url = source["url"];
+	        this.api_key = source["api_key"];
+	        this.enabled = source["enabled"];
+	        this.webhook_id = source["webhook_id"];
+	        this.delete_after_upload = source["delete_after_upload"];
+	    }
+	}
+	export class ArrConfig {
+	    instances: ArrInstance[];
+	
+	    static createFrom(source: any = {}) {
+	        return new ArrConfig(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.instances = this.convertValues(source["instances"], ArrInstance);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	
+	export class DuplicateLookupConfig {
+	    enabled: boolean;
+	    url: string;
+	    api_key: string;
+	    timeout: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DuplicateLookupConfig(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.enabled = source["enabled"];
+	        this.url = source["url"];
+	        this.api_key = source["api_key"];
+	        this.timeout = source["timeout"];
+	    }
+	}
 	export class PostUploadScriptConfig {
 	    enabled: boolean;
 	    command: string;
@@ -366,6 +551,7 @@ export namespace config {
 	}
 	export class QueueConfig {
 	    max_concurrent_uploads: number;
+	    min_size_to_start: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new QueueConfig(source);
@@ -374,6 +560,7 @@ export namespace config {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.max_concurrent_uploads = source["max_concurrent_uploads"];
+	        this.min_size_to_start = source["min_size_to_start"];
 	    }
 	}
 	export class DatabaseConfig {
@@ -421,6 +608,7 @@ export namespace config {
 	    }
 	}
 	export class WatcherConfig {
+	    name: string;
 	    enabled: boolean;
 	    watch_directory: string;
 	    size_threshold: number;
@@ -431,6 +619,8 @@ export namespace config {
 	    delete_original_file: boolean;
 	    single_nzb_per_folder: boolean;
 	    follow_symlinks: boolean;
+	    min_file_age: string;
+	    min_file_age_to_delete: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new WatcherConfig(source);
@@ -438,6 +628,7 @@ export namespace config {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
 	        this.enabled = source["enabled"];
 	        this.watch_directory = source["watch_directory"];
 	        this.size_threshold = source["size_threshold"];
@@ -448,6 +639,8 @@ export namespace config {
 	        this.delete_original_file = source["delete_original_file"];
 	        this.single_nzb_per_folder = source["single_nzb_per_folder"];
 	        this.follow_symlinks = source["follow_symlinks"];
+	        this.min_file_age = source["min_file_age"];
+	        this.min_file_age_to_delete = source["min_file_age_to_delete"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -473,6 +666,14 @@ export namespace config {
 	    redundancy: string;
 	    temp_dir: string;
 	    maintain_par2_files?: boolean;
+	    skip_if_par2_exists?: boolean;
+	    parpar_binary_path: string;
+	    parpar_extra_args: string[];
+	    num_goroutines: number;
+	    memory_limit: number;
+	    slice_size: number;
+	    max_concurrent_jobs: number;
+	    gf16_method: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Par2Config(source);
@@ -484,6 +685,14 @@ export namespace config {
 	        this.redundancy = source["redundancy"];
 	        this.temp_dir = source["temp_dir"];
 	        this.maintain_par2_files = source["maintain_par2_files"];
+	        this.skip_if_par2_exists = source["skip_if_par2_exists"];
+	        this.parpar_binary_path = source["parpar_binary_path"];
+	        this.parpar_extra_args = source["parpar_extra_args"];
+	        this.num_goroutines = source["num_goroutines"];
+	        this.memory_limit = source["memory_limit"];
+	        this.slice_size = source["slice_size"];
+	        this.max_concurrent_jobs = source["max_concurrent_jobs"];
+	        this.gf16_method = source["gf16_method"];
 	    }
 	}
 	export class PostCheck {
@@ -494,6 +703,9 @@ export namespace config {
 	    deferred_max_retries: number;
 	    deferred_max_backoff: string;
 	    deferred_check_interval: string;
+	    deferred_batch_size: number;
+	    stat_batch_size: number;
+	    max_concurrent_checks: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new PostCheck(source);
@@ -508,6 +720,9 @@ export namespace config {
 	        this.deferred_max_retries = source["deferred_max_retries"];
 	        this.deferred_max_backoff = source["deferred_max_backoff"];
 	        this.deferred_check_interval = source["deferred_check_interval"];
+	        this.deferred_batch_size = source["deferred_batch_size"];
+	        this.stat_batch_size = source["stat_batch_size"];
+	        this.max_concurrent_checks = source["max_concurrent_checks"];
 	    }
 	}
 	export class CustomHeader {
@@ -584,6 +799,7 @@ export namespace config {
 	    obfuscation_policy: string;
 	    par2_obfuscation_policy: string;
 	    group_policy: string;
+	    upload_buffer_memory_limit: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new PostingConfig(source);
@@ -602,6 +818,7 @@ export namespace config {
 	        this.obfuscation_policy = source["obfuscation_policy"];
 	        this.par2_obfuscation_policy = source["par2_obfuscation_policy"];
 	        this.group_policy = source["group_policy"];
+	        this.upload_buffer_memory_limit = source["upload_buffer_memory_limit"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -637,6 +854,7 @@ export namespace config {
 	    }
 	}
 	export class ServerConfig {
+	    name?: string;
 	    host: string;
 	    port: number;
 	    username: string;
@@ -647,7 +865,9 @@ export namespace config {
 	    max_connection_ttl_in_seconds: number;
 	    insecure_ssl: boolean;
 	    enabled?: boolean;
+	    role: string;
 	    check_only?: boolean;
+	    inflight: number;
 	    proxy_url?: string;
 	
 	    static createFrom(source: any = {}) {
@@ -656,6 +876,7 @@ export namespace config {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
 	        this.host = source["host"];
 	        this.port = source["port"];
 	        this.username = source["username"];
@@ -666,7 +887,9 @@ export namespace config {
 	        this.max_connection_ttl_in_seconds = source["max_connection_ttl_in_seconds"];
 	        this.insecure_ssl = source["insecure_ssl"];
 	        this.enabled = source["enabled"];
+	        this.role = source["role"];
 	        this.check_only = source["check_only"];
+	        this.inflight = source["inflight"];
 	        this.proxy_url = source["proxy_url"];
 	    }
 	}
@@ -677,13 +900,17 @@ export namespace config {
 	    posting: PostingConfig;
 	    post_check: PostCheck;
 	    par2: Par2Config;
-	    watcher: WatcherConfig;
+	    watcher?: WatcherConfig;
+	    watchers: WatcherConfig[];
 	    nzb_compression: NzbCompressionConfig;
 	    database: DatabaseConfig;
 	    queue: QueueConfig;
+	    api: APIConfig;
 	    output_dir: string;
 	    maintain_original_extension?: boolean;
 	    post_upload_script: PostUploadScriptConfig;
+	    arr?: ArrConfig;
+	    duplicate_lookup: DuplicateLookupConfig;
 	
 	    static createFrom(source: any = {}) {
 	        return new ConfigData(source);
@@ -698,12 +925,16 @@ export namespace config {
 	        this.post_check = this.convertValues(source["post_check"], PostCheck);
 	        this.par2 = this.convertValues(source["par2"], Par2Config);
 	        this.watcher = this.convertValues(source["watcher"], WatcherConfig);
+	        this.watchers = this.convertValues(source["watchers"], WatcherConfig);
 	        this.nzb_compression = this.convertValues(source["nzb_compression"], NzbCompressionConfig);
 	        this.database = this.convertValues(source["database"], DatabaseConfig);
 	        this.queue = this.convertValues(source["queue"], QueueConfig);
+	        this.api = this.convertValues(source["api"], APIConfig);
 	        this.output_dir = source["output_dir"];
 	        this.maintain_original_extension = source["maintain_original_extension"];
 	        this.post_upload_script = this.convertValues(source["post_upload_script"], PostUploadScriptConfig);
+	        this.arr = this.convertValues(source["arr"], ArrConfig);
+	        this.duplicate_lookup = this.convertValues(source["duplicate_lookup"], DuplicateLookupConfig);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -724,6 +955,7 @@ export namespace config {
 		    return a;
 		}
 	}
+	
 	
 	
 	
@@ -808,6 +1040,8 @@ export namespace progress {
 	    Description: string;
 	    Type: string;
 	    IsStarted: boolean;
+	    IsWaiting: boolean;
+	    WaitSecondsRemaining: number;
 	    IsPaused: boolean;
 	
 	    static createFrom(source: any = {}) {
@@ -826,6 +1060,8 @@ export namespace progress {
 	        this.Description = source["Description"];
 	        this.Type = source["Type"];
 	        this.IsStarted = source["IsStarted"];
+	        this.IsWaiting = source["IsWaiting"];
+	        this.WaitSecondsRemaining = source["WaitSecondsRemaining"];
 	        this.IsPaused = source["IsPaused"];
 	    }
 	}
@@ -849,6 +1085,7 @@ export namespace watcher {
 	    }
 	}
 	export class WatcherStatusInfo {
+	    name: string;
 	    enabled: boolean;
 	    initialized: boolean;
 	    watch_directory: string;
@@ -864,6 +1101,7 @@ export namespace watcher {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
 	        this.enabled = source["enabled"];
 	        this.initialized = source["initialized"];
 	        this.watch_directory = source["watch_directory"];

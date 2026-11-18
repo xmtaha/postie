@@ -5,9 +5,26 @@ import type { backend, config, processor, watcher } from "$lib/wailsjs/go/models
 
 const API_BASE = "/api";
 
+// Pool metrics are broadcast every five seconds, including while idle. Allow
+// three missed ticks before HTTP fallback takes over from a silent OPEN socket.
+const LIVE_SILENCE_TIMEOUT_MS = 15_000;
+
+export interface ArrInstance {
+	id: string;
+	name: string;
+	type: "radarr" | "sonarr" | "lidarr" | "readarr";
+	url: string;
+	api_key: string;
+	enabled: boolean;
+	webhook_id: number;
+	delete_after_upload: boolean;
+}
+
 export class WebClient {
 	private ws: WebSocket | null = null;
+	private lastActivityAt = Date.now();
 	private wsListeners: Map<string, (data: unknown) => void> = new Map();
+	private reconnectListeners = new Set<() => void>();
 
 	constructor() {
 		this.initWebSocket();
@@ -47,12 +64,17 @@ export class WebClient {
 		this.ws = new WebSocket(wsUrl);
 
 		this.ws.onopen = (event) => {
+			this.lastActivityAt = Date.now();
 			console.log("WebSocket connected successfully", event);
+			for (const listener of this.reconnectListeners) {
+				listener();
+			}
 		};
 
 		this.ws.onmessage = (event) => {
 			try {
 				const message = JSON.parse(event.data);
+				this.lastActivityAt = Date.now();
 
 				// Check if this is a structured message with type and data
 				if (message.type && message.data !== undefined) {
@@ -75,7 +97,13 @@ export class WebClient {
 		this.ws.onclose = (event) => {
 			console.log("WebSocket disconnected:", event.code, event.reason);
 			console.log("Attempting to reconnect in 3 seconds...");
-			setTimeout(() => this.initWebSocket(), 3000);
+			setTimeout(async () => {
+				try {
+					const response = await fetch("/api/auth/user", { signal: AbortSignal.timeout(15000) });
+					if (response.status === 401) { window.location.replace("/login"); return; }
+					this.initWebSocket();
+				} catch { this.initWebSocket(); }
+			}, 3000);
 		};
 
 		this.ws.onerror = (error) => {
@@ -86,16 +114,9 @@ export class WebClient {
 
 	// Add event listener for real-time updates
 	async on(event: string, callback: (data: unknown) => void): Promise<void> {
-		// Wait for WebSocket connection before registering listener
-		try {
-			await this.waitForConnection();
-		} catch (error) {
-			console.error(
-				"Failed to connect WebSocket before registering listener:",
-				error,
-			);
-		}
-
+		// Listeners survive reconnects and can be registered before OPEN.
+		// Deferring registration can miss early events or restore a listener
+		// that off() already removed while the handshake was pending.
 		this.wsListeners.set(event, callback);
 	}
 
@@ -104,8 +125,30 @@ export class WebClient {
 		this.wsListeners.delete(event);
 	}
 
+	isConnected(): boolean {
+		return this.ws?.readyState === WebSocket.OPEN &&
+			Date.now() - this.lastActivityAt < LIVE_SILENCE_TIMEOUT_MS;
+	}
+
+	// Fires on every successful (re)connection so event-driven views can re-sync.
+	onReconnect(callback: () => void): () => void {
+		this.reconnectListeners.add(callback);
+		return () => {
+			this.reconnectListeners.delete(callback);
+		};
+	}
+
+	// Requests that hang (e.g. the backend blocked on the database during a
+	// heavy upload batch) must not pile up and exhaust the browser's per-host
+	// connection pool — that is what froze the dashboard until a manual
+	// refresh. Abort instead, so the next poll gets a fresh attempt.
+	private static readonly REQUEST_TIMEOUT_MS = 15000;
+
 	async get<T>(endpoint: string): Promise<T> {
-		const response = await fetch(`${API_BASE}${endpoint}`);
+		const response = await fetch(`${API_BASE}${endpoint}`, {
+			signal: AbortSignal.timeout(WebClient.REQUEST_TIMEOUT_MS),
+		});
+		if (response.status === 401) window.location.replace("/login");
 		if (!response.ok) {
 			throw new Error(`HTTP error! status: ${response.status}`);
 		}
@@ -119,10 +162,13 @@ export class WebClient {
 				"Content-Type": "application/json",
 			},
 			body: data ? JSON.stringify(data) : undefined,
+			signal: AbortSignal.timeout(WebClient.REQUEST_TIMEOUT_MS),
 		});
 
+		if (response.status === 401) window.location.replace("/login");
 		if (!response.ok) {
-			throw new Error(`HTTP error! status: ${response.status}`);
+			const errText = await response.text();
+			throw new Error(errText.trim() || `HTTP error! status: ${response.status}`);
 		}
 
 		// Handle empty responses
@@ -133,8 +179,10 @@ export class WebClient {
 	async delete<T>(endpoint: string): Promise<T> {
 		const response = await fetch(`${API_BASE}${endpoint}`, {
 			method: "DELETE",
+			signal: AbortSignal.timeout(WebClient.REQUEST_TIMEOUT_MS),
 		});
 
+		if (response.status === 401) window.location.replace("/login");
 		if (!response.ok) {
 			throw new Error(`HTTP error! status: ${response.status}`);
 		}
@@ -163,6 +211,9 @@ export class WebClient {
 			sortBy: params.sortBy,
 			order: params.order,
 		});
+		if (params.status) {
+			queryParams.set("status", params.status);
+		}
 		return this.get<backend.PaginatedQueueResult>(`/queue?${queryParams}`);
 	}
 
@@ -183,8 +234,22 @@ export class WebClient {
 		return this.get<backend.ProcessorStatus>("/processor/status");
 	}
 
-	async getWatcherStatus(): Promise<watcher.WatcherStatusInfo> {
-		return this.get<watcher.WatcherStatusInfo>("/watcher/status");
+	async getWatcherStatus(): Promise<watcher.WatcherStatusInfo[]> {
+		return this.get<watcher.WatcherStatusInfo[]>("/watcher/status");
+	}
+
+	async triggerScan(): Promise<void> {
+		return this.post<void>("/watcher/scan");
+	}
+
+	async getApiKey(): Promise<string> {
+		const res = await this.get<{ key: string }>("/api-key");
+		return res.key;
+	}
+
+	async regenerateApiKey(): Promise<string> {
+		const res = await this.post<{ key: string }>("/api-key/regenerate");
+		return res.key;
 	}
 
 	async pauseProcessing(): Promise<void> {
@@ -227,6 +292,7 @@ export class WebClient {
 		const endpoint = `/logs${params.toString() ? `?${params.toString()}` : ""}`;
 		const response = await fetch(`${API_BASE}${endpoint}`);
 
+		if (response.status === 401) window.location.replace("/login");
 		if (!response.ok) {
 			throw new Error(`HTTP error! status: ${response.status}`);
 		}
@@ -371,6 +437,7 @@ export class WebClient {
 	async downloadNZB(id: string): Promise<void> {
 		const response = await fetch(`${API_BASE}/nzb/${id}/download`);
 
+		if (response.status === 401) window.location.replace("/login");
 		if (!response.ok) {
 			throw new Error(`HTTP error! status: ${response.status}`);
 		}
@@ -433,6 +500,10 @@ export class WebClient {
 		return this.get<backend.NntpPoolMetrics>("/metrics/nntp-pool");
 	}
 
+	async getTransferRuntimeMetrics(): Promise<backend.TransferRuntimeMetrics> {
+		return this.get<backend.TransferRuntimeMetrics>("/metrics/transfer-runtime");
+	}
+
 	// Filesystem operations
 	async browseFilesystem(path: string): Promise<{
 		path: string;
@@ -460,6 +531,7 @@ export class WebClient {
 	async downloadLogs(): Promise<void> {
 		const response = await fetch(`${API_BASE}/logs/download`);
 
+		if (response.status === 401) window.location.replace("/login");
 		if (!response.ok) {
 			throw new Error(`HTTP error! status: ${response.status}`);
 		}
@@ -479,6 +551,39 @@ export class WebClient {
 		a.click();
 		window.URL.revokeObjectURL(url);
 		document.body.removeChild(a);
+	}
+
+	// ── Arr webhook integration ─────────────────────────────────────────────
+
+	async getArrInstances(): Promise<ArrInstance[]> {
+		const res = await fetch(`${API_BASE}/arr/instances`);
+		if (!res.ok) throw new Error(await res.text());
+		return res.json();
+	}
+
+	async addArrInstance(instance: ArrInstance): Promise<ArrInstance> {
+		const webhookURL = window.location.origin;
+		const res = await fetch(`${API_BASE}/arr/instances`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ instance, webhook_url: webhookURL }),
+		});
+		if (!res.ok) throw new Error(await res.text());
+		return res.json();
+	}
+
+	async removeArrInstance(id: string): Promise<void> {
+		const res = await fetch(`${API_BASE}/arr/instances/${id}`, { method: "DELETE" });
+		if (!res.ok) throw new Error(await res.text());
+	}
+
+	async testArrConnection(instance: ArrInstance): Promise<void> {
+		const res = await fetch(`${API_BASE}/arr/instances/${instance.id}/test`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(instance),
+		});
+		if (!res.ok) throw new Error(await res.text());
 	}
 }
 

@@ -51,10 +51,14 @@ COPY ./frontend/embed.go ./frontend/embed.go
 COPY --from=frontend-builder /app/frontend/build ./frontend/build
 
 # Build web binary with enhanced cache mount for native architecture
+# netgo/osusergo are required: this is a fully static cgo binary, and without
+# them DNS goes through glibc getaddrinfo -> NSS, which dlopen()s the host's
+# libnss_*.so into a process with a different statically-linked glibc and
+# crashes with SIGFPE (issue #243). netgo compiles that path out entirely.
 RUN --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
     --mount=type=cache,target=/tmp/go-build-cache,sharing=locked \
     CGO_ENABLED=1 GOOS=linux \
-    go build -a -ldflags '-linkmode external -extldflags "-static"' -o postie-web cmd/web/main.go
+    go build -a -tags netgo,osusergo -ldflags '-linkmode external -extldflags "-static"' -o postie-web cmd/web/main.go
 
 # Final stage - use LinuxServer.io base image (has s6-overlay + PUID/PGID support)
 FROM ghcr.io/linuxserver/baseimage-ubuntu:jammy
@@ -96,9 +100,9 @@ VOLUME ["/config", "/watch", "/output"]
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/live || exit 1
+    CMD curl -f http://localhost:8080/live || exit 1
 
-LABEL org.opencontainers.image.source="https://github.com/javi11/postie"
+LABEL org.opencontainers.image.source="https://github.com/kipsilabs/postie"
 LABEL build_version="version: Build-date:- ${VERSION} ${BUILD_DATE}"
 LABEL maintainer="javi11"
 

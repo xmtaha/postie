@@ -8,15 +8,20 @@
             "description": "Dosya yüklemelerinizi yönetin ve ilerlemeyi izleyin",
             "add_files": "Dosya Ekle",
             "add_folder": "Klasör Ekle",
-            "add_folder_tooltip": "Tüm klasörü tek bir NZB olarak yükle",
+            "add_folder_tooltip": "Bir veya daha fazla klasörü her biri tek bir NZB olarak yükle",
             "folder_added": "Klasör Eklendi",
             "folder_added_description": "Klasör yükleme kuyruğuna eklendi",
+            "folders_added": "Klasörler Eklendi",
+            "folders_added_description": "{{count}} klasör yükleme kuyruğuna eklendi",
             "import_files": "Dosyaları İçe Aktar",
             "import_files_tooltip": "Uzak sunucudan dosyalara göz atın ve içe aktarın",
             "clear_completed": "Tamamlananları Temizle"
         },
         "queue": {
+					"reused_nzb": "NZB yeniden kullanıldı",
             "title": "Yükleme Kuyruğu",
+            "search_placeholder": "Dosya adı ara…",
+            "search_within_page": "yalnızca mevcut sayfa",
             "items": "öğe",
             "total_size": "Toplam Boyut",
             "nzb": "NZB",
@@ -51,6 +56,9 @@
             "next": "Sonraki",
             "retry_all_failed": "Başarısızları Tekrarla",
             "bulk_retry_success": "{count} öğe başarıyla yeniden denendi",
+            "delete_selected": "Seçilenleri Sil ({count})",
+            "confirm_delete_selected": "{count} seçili öğeyi silmek istediğinizden emin misiniz? Bu işlem geri alınamaz.",
+            "batch_deleted": "{count} öğe kuyruktan kaldırıldı.",
             "status_types": {
                 "pending": "bekliyor",
                 "complete": "tamamlandı",
@@ -59,10 +67,19 @@
                 "processing": "İşleniyor",
                 "completed": "Tamamlandı",
                 "failed": "Başarısız"
-            }
+            },
+            "verification": {
+                "pending": "Doğrulanıyor",
+                "failed": "Doğrulama başarısız",
+                "progress": "{total} makaleden {verified} doğrulandı"
+            },
+            "duration": "Süre",
+            "processing_time": "İşlem süresi"
         },
         "progress": {
             "title": "Yükleme İlerlemesi",
+            "file_size": "Dosya Boyutu",
+            "path": "Yol",
             "status": {
                 "active": "Aktif",
                 "idle": "Boşta",
@@ -71,7 +88,8 @@
             "task_status": {
                 "paused": "Duraklatıldı",
                 "in_progress": "Devam Ediyor",
-                "pending": "Bekliyor"
+                "pending": "Bekliyor",
+                "waiting": "Yayılım bekleniyor..."
             },
             "pause_processing": "İşlemeyi Duraklat",
             "resume_processing": "İşlemeye Devam Et",
@@ -118,6 +136,10 @@
                 "successfully_finished": "Başarıyla tamamlandı",
                 "errors_detected": "Algılanan Hatalar",
                 "failed_to_process": "İşlenemeyen öğeler",
+                "pending_verification": "Doğrulama Bekleniyor",
+                "pending_verification_hint": "Yüklendi; arka planda doğrulama bekleniyor",
+                "verification_failed": "Doğrulama Başarısız",
+                "verification_failed_hint": "Bazı makaleler doğrulanamadı; orijinaller korunuyor",
                 "failed_items": "Başarısız öğeler",
                 "queue_progress": "Kuyruk İlerlemesi",
                 "overall_completion": "Genel tamamlanma durumu",
@@ -136,6 +158,7 @@
         "job_failed": "Yükleme başarısız: {fileName}",
         "file_explorer": {
             "title": "Sunucudan Kuyruğa Dosya Ekle",
+            "close": "Kapat",
             "import_success": "Dosyalar kuyruğa başarıyla eklendi",
             "no_files_selected": "Dosya seçilmedi",
             "import_success_description": "{count} {count, plural, =1 {dosya} other {dosya}} kuyruğa başarıyla eklendi",
@@ -169,8 +192,25 @@
             "active_connections": "aktif bağlantı",
             "total_uploaded": "Toplam Yüklenen",
             "no_providers": "Yapılandırılmış sağlayıcı yok",
+            "avg_speed": "Ortalama Hız",
+            "missing": "Eksik",
+            "errors": "Hatalar",
+            "elapsed": "Çalışma Süresi",
+            "total_errors": "Toplam Hata",
+            "inflight": "Pipeline derinliği",
+            "current_speed": "Anlık Hız",
+            "ttfb": "TTFB",
+            "downloaded": "İndirilen",
+            "uploaded": "Yüklenen",
+            "upload_speed": "Yükleme Hızı",
+            "avg_upload_speed": "Ort. Yükleme Hızı",
+            "free_slots": "boş",
+            "quota": "Kota",
+            "quota_exceeded": "Aşıldı",
+            "quota_resets": "Sıfırlanma",
             "status": {
                 "connected": "Bağlandı",
+                "idle": "Boşta",
                 "connecting": "Bağlanıyor",
                 "reconnecting": "Yeniden Bağlanıyor",
                 "failed": "Başarısız",
@@ -192,7 +232,12 @@
             "next_run_soon": "Yakında",
             "next_run_minutes": "{count} {count, plural, =1 {dakika} other {dakika}} içinde",
             "next_run_hours": "{count} {count, plural, =1 {saat} other {saat}} içinde",
-            "next_run_days": "{count} {count, plural, =1 {gün} other {gün}} içinde"
+            "next_run_days": "{count} {count, plural, =1 {gün} other {gün}} içinde",
+            "scan_now": "Şimdi tara",
+            "scan_triggered": "Tarama başlatıldı",
+            "scan_triggered_description": "Dizin taraması başlatıldı",
+            "watcher_number": "İzleyici #{n}",
+            "no_watchers": "İzleme dizini yapılandırılmadı"
         }
     }
 }

@@ -10,15 +10,18 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/javi11/nntppool/v2"
-	"github.com/javi11/postie/internal/config"
-	"github.com/javi11/postie/internal/database"
-	"github.com/javi11/postie/internal/pool"
-	"github.com/javi11/postie/internal/processor"
-	"github.com/javi11/postie/internal/queue"
-	"github.com/javi11/postie/internal/watcher"
+	"crypto/tls"
+
+	"github.com/javi11/nntppool/v4"
+	"github.com/kipsilabs/postie/internal/config"
+	"github.com/kipsilabs/postie/internal/database"
+	"github.com/kipsilabs/postie/internal/pool"
+	"github.com/kipsilabs/postie/internal/processor"
+	"github.com/kipsilabs/postie/internal/queue"
+	"github.com/kipsilabs/postie/internal/watcher"
 	_ "github.com/mattn/go-sqlite3"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -26,12 +29,14 @@ import (
 
 // ServerData represents the server configuration data from the frontend
 type ServerData struct {
+	Name           string `json:"name"`
 	Host           string `json:"host"`
 	Port           int    `json:"port"`
 	Username       string `json:"username"`
 	Password       string `json:"password"`
 	SSL            bool   `json:"ssl"`
 	MaxConnections int    `json:"maxConnections"`
+	Role           string `json:"role"` // "upload" | "verify" | "" (defaults to upload)
 }
 
 // SetupWizardData represents the complete setup wizard data from the frontend
@@ -72,28 +77,38 @@ type ProcessorStatus struct {
 
 // NntpPoolMetrics represents NNTP connection pool metrics
 type NntpPoolMetrics struct {
-	Timestamp               string                `json:"timestamp"`
-	ActiveConnections       int                   `json:"activeConnections"`
-	TotalBytesUploaded      int64                 `json:"totalBytesUploaded"`
-	TotalBytesDownloaded    int64                 `json:"totalBytesDownloaded"`
-	TotalArticlesPosted     int64                 `json:"totalArticlesPosted"`
-	TotalArticlesDownloaded int64                 `json:"totalArticlesDownloaded"`
-	TotalErrors             int64                 `json:"totalErrors"`
-	ProviderErrors          map[string]int64      `json:"providerErrors"`
-	Providers               []NntpProviderMetrics `json:"providers"`
+	Timestamp         string                `json:"timestamp"`
+	ActiveConnections int                   `json:"activeConnections"`
+	TotalErrors       int64                 `json:"totalErrors"`
+	AvgSpeed          float64               `json:"avgSpeed"`
+	BytesConsumed     int64                 `json:"bytesConsumed"`
+	BytesUploaded     int64                 `json:"bytesUploaded"`  // article payload bytes posted, measured engine-side
+	UploadSpeed       float64               `json:"uploadSpeed"`    // bytes/sec over the trailing window
+	UploadAvgSpeed    float64               `json:"uploadAvgSpeed"` // bytes/sec since the first posted byte
+	Elapsed           string                `json:"elapsed"`
+	ProviderErrors    map[string]int64      `json:"providerErrors"`
+	Providers         []NntpProviderMetrics `json:"providers"`
 }
 
 // NntpProviderMetrics represents metrics for individual NNTP providers
 type NntpProviderMetrics struct {
-	Host                    string `json:"host"`
-	State                   string `json:"state"`
-	ActiveConnections       int    `json:"activeConnections"`
-	MaxConnections          int    `json:"maxConnections"`
-	TotalBytesUploaded      int64  `json:"totalBytesUploaded"`
-	TotalBytesDownloaded    int64  `json:"totalBytesDownloaded"`
-	TotalArticlesPosted     int64  `json:"totalArticlesPosted"`
-	TotalArticlesDownloaded int64  `json:"totalArticlesDownloaded"`
-	TotalErrors             int64  `json:"totalErrors"`
+	Name              string  `json:"name"`
+	Host              string  `json:"host"`
+	ActiveConnections int     `json:"activeConnections"`
+	MaxConnections    int     `json:"maxConnections"`
+	AvailableSlots    int     `json:"availableSlots"`
+	TotalErrors       int64   `json:"totalErrors"`
+	AvgSpeed          float64 `json:"avgSpeed"`
+	SpeedEwma         float64 `json:"speedEwma"` // recent throughput estimate (bytes/sec), 0 = no sample
+	BytesConsumed     int64   `json:"bytesConsumed"`
+	Missing           int64   `json:"missing"`
+	PingRTT           string  `json:"pingRTT"`
+	TTFB              string  `json:"ttfb"` // recent time-to-first-byte, "" = no sample
+	Inflight          int     `json:"inflight"`
+	QuotaBytes        int64   `json:"quotaBytes"` // 0 = no quota configured
+	QuotaUsed         int64   `json:"quotaUsed"`
+	QuotaResetAt      string  `json:"quotaResetAt"` // RFC3339, "" = no period
+	QuotaExceeded     bool    `json:"quotaExceeded"`
 }
 
 // App struct for the Wails application
@@ -101,12 +116,15 @@ type App struct {
 	ctx                  context.Context
 	config               *config.ConfigData
 	configPath           string
+	configFileMux        sync.RWMutex
+	configLocationErr    error
+	configLoadError      string
 	appPaths             *AppPaths
 	database             *database.Database
 	poolManager          *pool.Manager
 	queue                *queue.Queue
 	processor            *processor.Processor
-	watcher              *watcher.Watcher
+	watchers             []*watcher.Watcher
 	watchCtx             context.Context
 	watchCancel          context.CancelFunc
 	procCtx              context.Context
@@ -115,11 +133,21 @@ type App struct {
 	loggingError         string // Error message if file logging setup failed
 	actualLogPath        string // The actual log path being used (may differ from appPaths.Log if fallback was used)
 	isWebMode            bool
-	webEventEmitter      func(eventType string, data interface{})
+	webEventEmitter      func(eventType string, data any)
 	firstStart           bool
 	pendingConfig        *config.ConfigData
 	pendingConfigMux     sync.RWMutex
+	isApplyingConfig     atomic.Bool
 	postCheckWorker      *processor.PostCheckRetryWorker
+	broadcaster          *eventBroadcaster
+
+	// queueStatsCache short-circuits GetQueueStats polling: under a heavy
+	// upload batch the stats COUNT queries contend with upload writes on the
+	// single SQLite connection, and a hanging stats endpoint froze the web
+	// dashboard.
+	queueStatsMux      sync.Mutex
+	queueStatsCached   QueueStats
+	queueStatsCachedAt time.Time
 }
 
 // getCrashLogPath returns the path for crash logs
@@ -261,6 +289,11 @@ func setupLogging(logPath string) (string, error) {
 
 // NewApp creates a new App application struct
 func NewApp() *App {
+	return newApp(setupLogging)
+}
+
+// newApp keeps startup path resolution independent of the logging sink.
+func newApp(initializeLogging func(string) (string, error)) *App {
 	var loggingError string
 	var actualLogPath string
 
@@ -277,8 +310,14 @@ func NewApp() *App {
 		}
 	}
 
+	configPath, locationErr := resolveConfigPath(appPaths.Config)
+	if locationErr != nil {
+		configPath = appPaths.Config
+		slog.Error("Could not resolve saved configuration location", "error", locationErr)
+	}
+
 	// Setup logging with Windows-specific optimizations
-	actualLogPath, err = setupLogging(appPaths.Log)
+	actualLogPath, err = initializeLogging(appPaths.Log)
 	if err != nil {
 		// Fallback to basic stdout logging if file logging fails
 		logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -297,11 +336,12 @@ func NewApp() *App {
 		"actualLogPath", actualLogPath)
 
 	return &App{
-		configPath:    appPaths.Config,
-		appPaths:      appPaths,
-		loggingError:  loggingError,
-		actualLogPath: actualLogPath,
-		isWebMode:     false,
+		configPath:        configPath,
+		configLocationErr: locationErr,
+		appPaths:          appPaths,
+		loggingError:      loggingError,
+		actualLogPath:     actualLogPath,
+		isWebMode:         false,
 	}
 }
 
@@ -309,10 +349,17 @@ func NewApp() *App {
 func (a *App) SetWebMode(isWeb bool) {
 	slog.Info("Setting web mode", "isWeb", isWeb)
 	a.isWebMode = isWeb
+	if isWeb {
+		// The web server continues to use its existing default location.
+		a.configFileMux.Lock()
+		a.configPath = a.appPaths.Config
+		a.configLocationErr = nil
+		a.configFileMux.Unlock()
+	}
 }
 
 // SetWebEventEmitter sets the event emitter function for web mode
-func (a *App) SetWebEventEmitter(emitter func(eventType string, data interface{})) {
+func (a *App) SetWebEventEmitter(emitter func(eventType string, data any)) {
 	a.webEventEmitter = emitter
 }
 
@@ -333,22 +380,31 @@ func (a *App) Startup(ctx context.Context) {
 	slog.Info("First start determination", "isFirstStart", a.firstStart)
 
 	// Load initial configuration
-	if err := a.loadConfig(); err != nil {
-		slog.Info("Config file not found or invalid, creating default config", "path", a.configPath, "error", err)
-		// Continue with empty config - create default
-		if err := a.createDefaultConfig(); err != nil {
-			slog.Error("Failed to create default config", "error", err)
+	if a.configLocationErr != nil {
+		slog.Error("Cannot load saved configuration location", "error", a.configLocationErr)
+	} else if err := a.loadConfig(); err != nil {
+		if a.GetConfigPath() != a.appPaths.Config {
+			a.configLoadError = fmt.Sprintf("Cannot load configuration at %s: %v", a.GetConfigPath(), err)
+			slog.Error(a.configLoadError)
 		} else {
-			slog.Info("Default config created successfully", "path", a.configPath)
-			// Try to load the default config after creating it
-			if err := a.loadConfig(); err != nil {
-				slog.Error("Failed to load default config", "error", err)
+			slog.Info("Config file not found or invalid, creating default config", "path", a.GetConfigPath(), "error", err)
+			// Continue with empty config - create default
+			if err := a.createDefaultConfig(); err != nil {
+				slog.Error("Failed to create default config", "error", err)
 			} else {
-				slog.Info("Default config loaded successfully")
+				slog.Info("Default config created successfully", "path", a.GetConfigPath())
+				// Try to load the default config after creating it.
+				// On first start this is expected to fail validation (no servers yet),
+				// so log at Debug rather than Error.
+				if err := a.loadConfig(); err != nil {
+					slog.Debug("Default config validation pending (expected on first start)", "error", err)
+				} else {
+					slog.Info("Default config loaded successfully")
+				}
 			}
 		}
 	} else {
-		slog.Info("Config loaded successfully", "path", a.configPath)
+		slog.Info("Config loaded successfully", "path", a.GetConfigPath())
 	}
 
 	// Initialize connection pool manager if we have a valid configuration
@@ -363,25 +419,33 @@ func (a *App) Startup(ctx context.Context) {
 		}
 	}
 
-	// Initialize queue (always available)
-	if err := a.initializeQueue(); err != nil {
-		slog.Error(fmt.Sprintf("Failed to initialize queue: %v", err))
+	if a.firstStart || a.config == nil {
+		slog.Info("Skipping component initialization: configuration required")
+	} else {
+		// Initialize queue (always available)
+		if err := a.initializeQueue(); err != nil {
+			slog.Error(fmt.Sprintf("Failed to initialize queue: %v", err))
+		}
+
+		// Initialize processor if configuration is valid
+		if err := a.initializeProcessor(); err != nil {
+			a.criticalErrorMessage = err.Error()
+			slog.Error(fmt.Sprintf("Failed to initialize processor: %v", err))
+		}
+
+		// Initialize post check retry worker if post check is enabled
+		a.initializePostCheckWorker()
+
+		// Initialize watchers if enabled and configuration is valid
+		if err := a.initializeWatchers(); err != nil {
+			slog.Error(fmt.Sprintf("Failed to initialize watchers: %v", err))
+		}
 	}
 
-	// Initialize processor if configuration is valid
-	if err := a.initializeProcessor(); err != nil {
-		a.criticalErrorMessage = err.Error()
-		slog.Error(fmt.Sprintf("Failed to initialize processor: %v", err))
-	}
-
-	// Initialize post check retry worker if post check is enabled
-	a.initializePostCheckWorker()
-
-	// Initialize watcher if enabled and configuration is valid
-	if err := a.initializeWatcher(); err != nil {
-		slog.Error(fmt.Sprintf("Failed to initialize watcher: %v", err))
-	}
-
+	// Start the event broadcaster. It runs in both web and desktop modes and
+	// drives push events that replace per-client polling.
+	a.broadcaster = newEventBroadcaster(a)
+	a.broadcaster.start()
 }
 
 // Shutdown gracefully shuts down the application and closes all resources
@@ -390,6 +454,12 @@ func (a *App) Shutdown() {
 
 	slog.Info("Application shutdown initiated")
 
+	// Stop the event broadcaster before tearing down the components it reads from.
+	if a.broadcaster != nil {
+		a.broadcaster.stop()
+		a.broadcaster = nil
+	}
+
 	// Stop post check retry worker if running
 	if a.postCheckWorker != nil {
 		slog.Info("Stopping post check retry worker")
@@ -397,11 +467,15 @@ func (a *App) Shutdown() {
 		a.postCheckWorker = nil
 	}
 
-	// Stop watcher if running
-	if a.watcher != nil {
-		slog.Info("Stopping watcher")
-		_ = a.watcher.Close()
+	// Stop watchers if running
+	if a.watchCancel != nil {
+		a.watchCancel()
+		a.watchCancel = nil
 	}
+	for _, w := range a.watchers {
+		_ = w.Close()
+	}
+	a.watchers = nil
 
 	// Stop processor if running
 	if a.processor != nil {
@@ -432,12 +506,16 @@ func (a *App) GetAppStatus() AppStatus {
 		}
 	}
 
+	configError := a.configurationError()
+	if a.criticalErrorMessage != "" {
+		configError = a.criticalErrorMessage
+	}
 	status := AppStatus{
 		HasConfig:           a.config != nil,
-		ConfigPath:          a.configPath,
+		ConfigPath:          a.GetConfigPath(),
 		Uploading:           a.IsUploading(),
-		CriticalConfigError: false, // Default to false
-		Error:               "",
+		CriticalConfigError: configError != "",
+		Error:               configError,
 		IsFirstStart:        a.isFirstStart(),
 		Version:             version,
 	}
@@ -466,20 +544,18 @@ func (a *App) GetAppStatus() AppStatus {
 		status.NeedsConfiguration = true
 	}
 
-	slog.Debug("Current application status", "status", status)
-
 	return status
 }
 
 // GetLoggingStatus returns information about logging configuration
-func (a *App) GetLoggingStatus() map[string]interface{} {
+func (a *App) GetLoggingStatus() map[string]any {
 	// Determine the actual log path being used
 	logPath := a.actualLogPath
 	if logPath == "" {
 		logPath = a.appPaths.Log
 	}
 
-	status := map[string]interface{}{
+	status := map[string]any{
 		"configuredLogPath": a.appPaths.Log,            // The originally configured path
 		"actualLogPath":     logPath,                   // The actual path being used (may be fallback)
 		"usingFallback":     logPath != a.appPaths.Log, // True if using a fallback path
@@ -532,6 +608,45 @@ func (a *App) GetProcessorStatus() ProcessorStatus {
 	}
 
 	return status
+}
+
+// TransferRuntimeMetrics is the backend-facing view of process-wide upload/PAR2
+// scheduler metrics for the diagnostics dashboard.
+type TransferRuntimeMetrics struct {
+	UploadActiveWorkers int64   `json:"uploadActiveWorkers"`
+	UploadQueuedWorkers int64   `json:"uploadQueuedWorkers"`
+	UploadWorkerCount   int64   `json:"uploadWorkerCount"`
+	UploadReservedBytes int64   `json:"uploadReservedBytes"`
+	UploadBudgetBytes   int64   `json:"uploadBudgetBytes"`
+	UploadBytes         int64   `json:"uploadBytes"`
+	UploadSpeedBps      float64 `json:"uploadSpeedBps"`
+	UploadAvgSpeedBps   float64 `json:"uploadAvgSpeedBps"`
+	Par2ActiveJobs      int64   `json:"par2ActiveJobs"`
+	Par2QueuedJobs      int64   `json:"par2QueuedJobs"`
+	Par2Capacity        int     `json:"par2Capacity"`
+}
+
+// GetTransferRuntimeMetrics returns process-wide upload/PAR2 scheduler metrics
+// (active/queued upload workers, reserved/configured buffer bytes, active/queued
+// PAR2 jobs) for the diagnostics dashboard. Zero value when no processor.
+func (a *App) GetTransferRuntimeMetrics() TransferRuntimeMetrics {
+	if a.processor == nil {
+		return TransferRuntimeMetrics{}
+	}
+	m := a.processor.TransferRuntimeMetrics()
+	return TransferRuntimeMetrics{
+		UploadActiveWorkers: m.UploadActiveWorkers,
+		UploadQueuedWorkers: m.UploadQueuedWorkers,
+		UploadWorkerCount:   m.UploadWorkerCount,
+		UploadReservedBytes: m.UploadReservedBytes,
+		UploadBudgetBytes:   m.UploadBudgetBytes,
+		UploadBytes:         m.UploadBytes,
+		UploadSpeedBps:      m.UploadSpeedBps,
+		UploadAvgSpeedBps:   m.UploadAvgSpeedBps,
+		Par2ActiveJobs:      m.Par2ActiveJobs,
+		Par2QueuedJobs:      m.Par2QueuedJobs,
+		Par2Capacity:        m.Par2Capacity,
+	}
 }
 
 // GetRunningJobs returns currently running jobs from the processor
@@ -642,10 +757,7 @@ func (a *App) GetLogsPaginated(limit, offset int) (string, error) {
 		}
 
 		const maxLogSize = 1024 * 1024
-		start := stat.Size() - maxLogSize
-		if start < 0 {
-			start = 0
-		}
+		start := max(stat.Size()-maxLogSize, 0)
 
 		buffer := make([]byte, stat.Size()-start)
 		_, err = file.ReadAt(buffer, start)
@@ -780,7 +892,7 @@ func (a *App) HandleDroppedFiles(filePaths []string) error {
 
 				// Add the root folder to the queue with FOLDER: prefix (processor will collect all nested files)
 				folderQueuePath := "FOLDER:" + filePath
-				if err := a.queue.AddFile(context.Background(), folderQueuePath, totalSize); err != nil {
+				if err := a.queue.AddManualFile(context.Background(), folderQueuePath, totalSize); err != nil {
 					slog.Warn("Could not add folder to queue, skipping", "folder", filePath, "error", err)
 					continue
 				}
@@ -792,7 +904,7 @@ func (a *App) HandleDroppedFiles(filePaths []string) error {
 			}
 
 			// Handle individual files (existing logic)
-			if err := a.queue.AddFile(context.Background(), filePath, info.Size()); err != nil {
+			if err := a.queue.AddManualFile(context.Background(), filePath, info.Size()); err != nil {
 				slog.Warn("Could not add dropped file to queue, skipping", "file", filePath, "error", err)
 				continue
 			}
@@ -840,6 +952,18 @@ func (a *App) SetupWizardComplete(wizardData SetupWizardData) error {
 		return fmt.Errorf("output directory must be specified")
 	}
 
+	// Validate at least one upload server exists
+	uploadCount := 0
+	for _, s := range wizardData.Servers {
+		if s.Role != string(config.ServerRoleVerify) {
+			uploadCount++
+		}
+	}
+	if uploadCount == 0 {
+		slog.Error("Setup wizard failed: no upload servers provided")
+		return fmt.Errorf("at least one upload server is required")
+	}
+
 	// Validate all servers have required fields
 	for i, serverData := range wizardData.Servers {
 		if serverData.Host == "" {
@@ -866,7 +990,12 @@ func (a *App) SetupWizardComplete(wizardData SetupWizardData) error {
 	cfg.Servers = make([]config.ServerConfig, len(wizardData.Servers))
 	for i, serverData := range wizardData.Servers {
 		enabled := true
+		role := config.ServerRoleUpload
+		if serverData.Role == string(config.ServerRoleVerify) {
+			role = config.ServerRoleVerify
+		}
 		server := config.ServerConfig{
+			Name:           serverData.Name,
 			Host:           serverData.Host,
 			Port:           serverData.Port,
 			Username:       serverData.Username,
@@ -874,9 +1003,10 @@ func (a *App) SetupWizardComplete(wizardData SetupWizardData) error {
 			SSL:            serverData.SSL,
 			MaxConnections: serverData.MaxConnections,
 			Enabled:        &enabled,
+			Role:           role,
 		}
 		cfg.Servers[i] = server
-		slog.Debug("Configured server", "index", i, "host", serverData.Host, "port", serverData.Port, "ssl", serverData.SSL)
+		slog.Debug("Configured server", "index", i, "host", serverData.Host, "port", serverData.Port, "ssl", serverData.SSL, "role", role)
 	}
 
 	// Set output directory
@@ -887,16 +1017,16 @@ func (a *App) SetupWizardComplete(wizardData SetupWizardData) error {
 	cfg.Database.DatabasePath = a.appPaths.Database
 
 	// Save configuration with enhanced error context
-	slog.Info("Saving setup wizard configuration", "configPath", a.configPath)
+	slog.Info("Saving setup wizard configuration", "configPath", a.GetConfigPath())
 	if err := a.SaveConfig(&cfg); err != nil {
-		slog.Error("Failed to save setup wizard configuration", "error", err, "configPath", a.configPath)
+		slog.Error("Failed to save setup wizard configuration", "error", err, "configPath", a.GetConfigPath())
 		return a.wrapSaveConfigError(err)
 	}
 
 	// Mark as no longer first start since setup is complete
 	a.firstStart = false
 
-	slog.Info("Setup wizard completed successfully", "configPath", a.configPath)
+	slog.Info("Setup wizard completed successfully", "configPath", a.GetConfigPath())
 	return nil
 }
 
@@ -908,7 +1038,7 @@ func (a *App) ValidateNNTPServer(serverData ServerData) ValidationResult {
 	return a.TestProviderConnectivity(serverData)
 }
 
-// TestProviderConnectivity tests an individual provider's connectivity using the new nntppool method
+// TestProviderConnectivity tests an individual provider's connectivity using the nntppool v4 method
 func (a *App) TestProviderConnectivity(serverData ServerData) ValidationResult {
 	defer a.recoverPanic("TestProviderConnectivity")
 
@@ -926,35 +1056,66 @@ func (a *App) TestProviderConnectivity(serverData ServerData) ValidationResult {
 		}
 	}
 
-	// Convert to nntppool provider config
-	providerConfig := nntppool.UsenetProviderConfig{
-		Host:                           serverData.Host,
-		Port:                           serverData.Port,
-		Username:                       serverData.Username,
-		Password:                       serverData.Password,
-		TLS:                            serverData.SSL,
-		MaxConnections:                 1, // Use single connection for testing
-		MaxConnectionIdleTimeInSeconds: 300,
-		MaxConnectionTTLInSeconds:      3600,
-		InsecureSSL:                    false,
+	// Convert to nntppool v4 Provider
+	addr := fmt.Sprintf("%s:%d", serverData.Host, serverData.Port)
+	provider := nntppool.Provider{
+		Host:        addr,
+		Auth:        nntppool.Auth{Username: serverData.Username, Password: serverData.Password},
+		Connections: 1, // Use single connection for testing
 	}
 
-	// Use the new TestProviderConnectivity method from nntppool
-	// Note: The exact parameters may need adjustment based on the actual nntppool API
-	ctx := context.Background()
-	err := nntppool.TestProviderConnectivity(ctx, providerConfig, nil, nil)
-	if err != nil {
-		slog.Warn("Provider connectivity test failed", "host", serverData.Host, "port", serverData.Port, "error", err)
-		return ValidationResult{
-			Valid: false,
-			Error: fmt.Sprintf("Connection test failed: %v", err),
+	if serverData.SSL {
+		provider.TLSConfig = &tls.Config{
+			ServerName: serverData.Host,
 		}
 	}
 
-	slog.Info("Provider connectivity test successful", "host", serverData.Host, "port", serverData.Port)
+	// Use TestProvider from nntppool v4
+	ctx := context.Background()
+	result := nntppool.TestProvider(ctx, provider)
+	if result.Err != nil {
+		slog.Warn("Provider connectivity test failed", "host", serverData.Host, "port", serverData.Port, "error", result.Err)
+		return ValidationResult{
+			Valid: false,
+			Error: fmt.Sprintf("Connection test failed: %v", result.Err),
+		}
+	}
+
+	slog.Info("Provider connectivity test successful", "host", serverData.Host, "port", serverData.Port, "rtt", result.RTT)
 	return ValidationResult{
 		Valid: true,
 		Error: "",
+	}
+}
+
+// ProcessingPauseState is the payload broadcast with pause-related events. A
+// full snapshot lets the UI render the header without follow-up RPCs.
+type ProcessingPauseState struct {
+	Paused     bool   `json:"paused"`
+	AutoPaused bool   `json:"autoPaused"`
+	Reason     string `json:"reason"`
+}
+
+// pauseState returns a snapshot of the current pause/auto-pause state.
+func (a *App) pauseState() ProcessingPauseState {
+	return ProcessingPauseState{
+		Paused:     a.IsProcessingPaused(),
+		AutoPaused: a.IsProcessingAutoPaused(),
+		Reason:     a.GetAutoPauseReason(),
+	}
+}
+
+// emit dispatches an event through the active transport (Wails runtime in
+// desktop mode, the WebSocket hub in web mode).
+func (a *App) emit(eventType string, payload any) {
+	if a.isWebMode {
+		if a.webEventEmitter != nil {
+			a.webEventEmitter(eventType, payload)
+		}
+		return
+	}
+	if a.ctx != nil {
+		wailsruntime.EventsEmit(a.ctx, eventType, payload)
 	}
 }
 
@@ -969,12 +1130,7 @@ func (a *App) PauseProcessing() error {
 	a.processor.PauseProcessing()
 	slog.Info("Processing paused via API")
 
-	// Emit events for both desktop and web modes
-	if !a.isWebMode {
-		wailsruntime.EventsEmit(a.ctx, "processing:paused")
-	} else if a.webEventEmitter != nil {
-		a.webEventEmitter("processing:paused", nil)
-	}
+	a.emit("processing:paused", a.pauseState())
 
 	return nil
 }
@@ -990,12 +1146,7 @@ func (a *App) ResumeProcessing() error {
 	a.processor.ResumeProcessing()
 	slog.Info("Processing resumed via API")
 
-	// Emit events for both desktop and web modes
-	if !a.isWebMode {
-		wailsruntime.EventsEmit(a.ctx, "processing:resumed")
-	} else if a.webEventEmitter != nil {
-		a.webEventEmitter("processing:resumed", nil)
-	}
+	a.emit("processing:resumed", a.pauseState())
 
 	return nil
 }
@@ -1039,15 +1190,13 @@ func (a *App) GetNntpPoolMetrics() (NntpPoolMetrics, error) {
 
 	// Default empty metrics if no pool available
 	emptyMetrics := NntpPoolMetrics{
-		Timestamp:               time.Now().Format(time.RFC3339),
-		ActiveConnections:       0,
-		TotalBytesUploaded:      0,
-		TotalBytesDownloaded:    0,
-		TotalArticlesPosted:     0,
-		TotalArticlesDownloaded: 0,
-		TotalErrors:             0,
-		ProviderErrors:          make(map[string]int64),
-		Providers:               []NntpProviderMetrics{},
+		Timestamp:         time.Now().Format(time.RFC3339),
+		ActiveConnections: 0,
+		TotalErrors:       0,
+		AvgSpeed:          0,
+		Elapsed:           "",
+		ProviderErrors:    make(map[string]int64),
+		Providers:         []NntpProviderMetrics{},
 	}
 
 	// Get metrics from the connection pool manager
@@ -1056,44 +1205,90 @@ func (a *App) GetNntpPoolMetrics() (NntpPoolMetrics, error) {
 		return emptyMetrics, nil
 	}
 
-	// Get metrics from the pool manager
-	snapshot, err := a.poolManager.GetMetrics()
+	// Get metrics from the pool manager (v4 returns ClientStats)
+	stats, err := a.poolManager.GetMetrics()
 	if err != nil {
 		slog.Error("Failed to get metrics from pool manager", "error", err)
 		return emptyMetrics, fmt.Errorf("failed to get pool metrics: %w", err)
 	}
 
-	// Sum active connections from all providers
+	// Sum active connections and errors from all providers
 	activeConnections := 0
-	for _, provider := range snapshot.ProviderMetrics {
+	var totalErrors int64
+	providerErrors := make(map[string]int64)
+	for _, provider := range stats.Providers {
 		activeConnections += provider.ActiveConnections
+		totalErrors += provider.Errors
+		providerErrors[provider.Name] = provider.Errors
 	}
 
-	// Convert pool metrics to our metrics structure
+	// nntppool's speed/bytes fields count wire bytes read, which for a poster
+	// is only the status lines; real upload throughput comes from the engine.
+	upload := a.GetTransferRuntimeMetrics()
 	metrics := NntpPoolMetrics{
-		Timestamp:               snapshot.Timestamp.Format(time.RFC3339),
-		ActiveConnections:       activeConnections,
-		TotalBytesUploaded:      snapshot.BytesUploaded,
-		TotalBytesDownloaded:    snapshot.BytesDownloaded,
-		TotalArticlesPosted:     snapshot.ArticlesPosted,
-		TotalArticlesDownloaded: snapshot.ArticlesDownloaded,
-		TotalErrors:             snapshot.TotalErrors,
-		ProviderErrors:          snapshot.ProviderErrors,
+		Timestamp:         time.Now().Format(time.RFC3339),
+		ActiveConnections: activeConnections,
+		TotalErrors:       totalErrors,
+		AvgSpeed:          stats.AvgSpeed,
+		BytesConsumed:     stats.BytesConsumed,
+		BytesUploaded:     upload.UploadBytes,
+		UploadSpeed:       upload.UploadSpeedBps,
+		UploadAvgSpeed:    upload.UploadAvgSpeedBps,
+		Elapsed:           stats.Elapsed.String(),
+		ProviderErrors:    providerErrors,
 	}
 
-	// Convert provider metrics from map to array
-	providers := make([]NntpProviderMetrics, 0, len(snapshot.ProviderMetrics))
-	for _, provider := range snapshot.ProviderMetrics {
+	// Build maps from provider address to config for quick lookup.
+	// Key format matches nntppool's internal provider name: "host:port+username" or "host:port".
+	providerAddrKey := func(host string, port int, username string) string {
+		if username != "" {
+			return fmt.Sprintf("%s:%d+%s", host, port, username)
+		}
+		return fmt.Sprintf("%s:%d", host, port)
+	}
+	inflightByAddr := make(map[string]int)
+	nameByAddr := make(map[string]string)
+	if a.config != nil {
+		for _, srv := range a.config.Servers {
+			key := providerAddrKey(srv.Host, srv.Port, srv.Username)
+			inflight := srv.Inflight
+			if inflight <= 0 {
+				inflight = 10
+			}
+			inflightByAddr[key] = inflight
+			nameByAddr[key] = srv.Name
+		}
+	}
+
+	// Convert provider metrics from v4 ProviderStats
+	providers := make([]NntpProviderMetrics, 0, len(stats.Providers))
+	for _, provider := range stats.Providers {
+		ttfb := ""
+		if provider.TTFB > 0 {
+			ttfb = provider.TTFB.String()
+		}
+		quotaResetAt := ""
+		if !provider.QuotaResetAt.IsZero() {
+			quotaResetAt = provider.QuotaResetAt.Format(time.RFC3339)
+		}
 		providers = append(providers, NntpProviderMetrics{
-			Host:                    provider.Host,
-			State:                   provider.State,
-			ActiveConnections:       provider.ActiveConnections,
-			MaxConnections:          provider.MaxConnections,
-			TotalBytesUploaded:      provider.BytesUploaded,
-			TotalBytesDownloaded:    provider.BytesDownloaded,
-			TotalArticlesPosted:     provider.ArticlesPosted,
-			TotalArticlesDownloaded: provider.ArticlesDownloaded,
-			TotalErrors:             provider.TotalErrors,
+			Name:              nameByAddr[provider.Name],
+			Host:              provider.Name,
+			ActiveConnections: provider.ActiveConnections,
+			MaxConnections:    provider.MaxConnections,
+			AvailableSlots:    provider.AvailableSlots,
+			TotalErrors:       provider.Errors,
+			AvgSpeed:          provider.AvgSpeed,
+			SpeedEwma:         provider.SpeedEWMA,
+			BytesConsumed:     provider.BytesConsumed,
+			Missing:           provider.Missing,
+			PingRTT:           provider.Ping.RTT.String(),
+			TTFB:              ttfb,
+			Inflight:          inflightByAddr[provider.Name],
+			QuotaBytes:        provider.QuotaBytes,
+			QuotaUsed:         provider.QuotaUsed,
+			QuotaResetAt:      quotaResetAt,
+			QuotaExceeded:     provider.QuotaExceeded,
 		})
 	}
 	metrics.Providers = providers
@@ -1104,14 +1299,20 @@ func (a *App) GetNntpPoolMetrics() (NntpPoolMetrics, error) {
 // determineFirstStart checks if this is the first time the application is being run
 // This must be called BEFORE any config creation
 func (a *App) determineFirstStart() bool {
+	// A saved custom location must not send the user through first-run setup
+	// when unavailable, since setup would replace their saved configuration.
+	if a.configLocationErr != nil || a.GetConfigPath() != a.appPaths.Config {
+		return false
+	}
+
 	// Check if config file exists
-	if _, err := os.Stat(a.configPath); os.IsNotExist(err) {
-		slog.Info("Config file does not exist, treating as first start", "configPath", a.configPath)
+	if _, err := os.Stat(a.GetConfigPath()); os.IsNotExist(err) {
+		slog.Info("Config file does not exist, treating as first start", "configPath", a.GetConfigPath())
 		return true
 	}
 
 	// If config file exists, try to load it to check if it has meaningful content
-	_, err := config.Load(a.configPath)
+	_, err := config.Load(a.GetConfigPath())
 	if err != nil {
 		slog.Info("Config file exists but cannot be loaded, treating as first start", "error", err)
 		return true

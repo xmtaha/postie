@@ -1,5 +1,21 @@
 {
 	"common": {
+		"auth": {
+			"retry": "Réessayer",
+			"signIn": "Se connecter à Postie",
+			"createAdmin": "Créer le compte administrateur",
+			"signOut": "Se déconnecter",
+			"username": "Nom d’utilisateur ou e-mail",
+			"email": "E-mail (facultatif)",
+			"password": "Mot de passe",
+			"bootstrapDescription": "Créez le premier compte administrateur. Les inscriptions seront ensuite fermées.",
+			"passwordHint": "Utilisez un mot de passe de 12 à 72 octets.",
+			"invalidCredentials": "Identifiants incorrects.",
+			"registrationError": "Inscription impossible. Vérifiez les informations ou connectez-vous si un compte existe.",
+			"connectionError": "Connexion au serveur impossible. Rechargez pour réessayer.",
+			"tooManyAttempts": "Trop de tentatives. Attendez une minute.",
+			"logoutError": "Déconnexion impossible."
+		},
 		"app_name": "Postie",
 		"nav": {
 			"dashboard": "Tableau de bord",
@@ -7,14 +23,20 @@
 			"metrics": "Métriques",
 			"logs": "Logs",
 			"language": "Langue",
-			"theme": "Thème"
+			"theme": "Thème",
+			"menu": "Ouvrir le menu",
+			"closeMenu": "Fermer le menu",
+			"primary": "Navigation principale"
 		},
 		"actions": {
+			"reset": "Réinitialiser",
+			"confirm": "Confirmer",
 			"save": "Sauvegarder",
 			"cancel": "Annuler",
 			"delete": "Supprimer",
 			"edit": "Modifier",
 			"add": "Ajouter",
+			"close": "Fermer",
 			"browse": "Parcourir",
 			"upload": "Télécharger",
 			"download": "Télécharger",
@@ -37,6 +59,8 @@
 			"paused": "En pause"
 		},
 		"common": {
+			"applying": "Application…",
+			"discarding": "Annulation…",
 			"saving": "Sauvegarde...",
 			"clearing": "Suppression...",
 			"clear": "Vider",
@@ -105,6 +129,17 @@
 			"configuration_saved": "Configuration sauvegardée",
 			"configuration_saved_description": "Votre configuration a été sauvegardée avec succès !",
 			"configuration_save_failed": "Échec de la sauvegarde de la configuration"
+		},
+		"appearance": {
+			"label": "Apparence",
+			"system": "Système",
+			"light": "Clair",
+			"dark": "Sombre"
+		},
+		"connection": {
+			"connected": "Connecté",
+			"reconnecting": "Reconnexion…",
+			"disconnected": "Déconnecté"
 		}
 	},
 	"logs": {

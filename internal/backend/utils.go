@@ -59,10 +59,7 @@ func readLogLines(file *os.File, limit, offset int) (string, error) {
 		return "", nil // No lines to return
 	}
 
-	startIndex := endIndex - limit
-	if startIndex < 0 {
-		startIndex = 0
-	}
+	startIndex := max(endIndex-limit, 0)
 
 	// Ensure we don't go out of bounds
 	if startIndex >= totalLines {
@@ -89,12 +86,12 @@ func (a *App) wrapSaveConfigError(err error) error {
 
 	// Permission errors
 	if os.IsPermission(err) || strings.Contains(errStr, "permission denied") {
-		return fmt.Errorf("permission denied: cannot write configuration to '%s'. Please check directory permissions", a.configPath)
+		return fmt.Errorf("permission denied: cannot write configuration to '%s'. Please check directory permissions", a.GetConfigPath())
 	}
 
 	// Directory doesn't exist
 	if os.IsNotExist(err) {
-		return fmt.Errorf("configuration directory does not exist: '%s'", filepath.Dir(a.configPath))
+		return fmt.Errorf("configuration directory does not exist: '%s'", filepath.Dir(a.GetConfigPath()))
 	}
 
 	// Disk full
@@ -108,7 +105,7 @@ func (a *App) wrapSaveConfigError(err error) error {
 	}
 
 	// Generic fallback with path context
-	return fmt.Errorf("failed to save configuration to '%s': %v", a.configPath, err)
+	return fmt.Errorf("failed to save configuration to '%s': %v", a.GetConfigPath(), err)
 }
 
 // processDirectoryRecursively processes a directory and returns collected files grouped by folder

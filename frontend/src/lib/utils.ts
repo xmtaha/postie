@@ -26,6 +26,24 @@ export function formatDate(dateString: string): string {
 	return new Date(dateString).toLocaleString();
 }
 
+export function formatElapsed(elapsed: string): string {
+	if (!elapsed || elapsed === "—") return "—";
+
+	const hoursMatch = elapsed.match(/(\d+)h/);
+	const minutesMatch = elapsed.match(/(\d+)m/);
+
+	const hours = hoursMatch ? parseInt(hoursMatch[1]) : 0;
+	const minutes = minutesMatch ? parseInt(minutesMatch[1]) : 0;
+
+	if (hours > 0) {
+		return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+	}
+	if (minutes > 0) {
+		return `${minutes}m`;
+	}
+	return "< 1m";
+}
+
 /**
  * Format time in milliseconds to human readable format (HH:MM:SS or MM:SS)
  */
@@ -113,13 +131,13 @@ export function getStatusBadgeClass(status: string): string {
 export function getStatusIconClass(status: string): string {
 	switch (status) {
 		case "pending":
-			return "text-warning";
+			return "text-warning-ink";
 		case "complete":
 			return "text-success";
 		case "error":
 			return "text-error";
 		default:
-			return "text-base-content/50";
+			return "text-base-content/65";
 	}
 }
 
@@ -152,6 +170,21 @@ export function parseDuration(durationStr: string): number {
 		default:
 			return 0;
 	}
+}
+
+/**
+ * Format duration in milliseconds to compact human-readable format (e.g., "2h 15m", "45m 30s", "12s")
+ */
+export function formatDuration(ms: number): string {
+	const absMs = Math.abs(ms);
+	if (absMs < 1000) return "—";
+	const totalSeconds = Math.floor(absMs / 1000);
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	if (hours > 0) return `${hours}h ${minutes}m`;
+	if (minutes > 0) return `${minutes}m ${seconds}s`;
+	return `${seconds}s`;
 }
 
 /**

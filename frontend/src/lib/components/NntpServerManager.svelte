@@ -2,8 +2,11 @@
   import apiClient from "$lib/api/client";
   import { t } from "$lib/i18n";
   import { toastStore } from "$lib/stores/toast";
-  import { backend, config as configType } from "$lib/wailsjs/go/models";
-  import { Check, CirclePlus, Loader2, Trash2, Server } from "lucide-svelte";
+  import { config as configType } from "$lib/wailsjs/go/models";
+  import { Check, ChevronDown, CirclePlus, Info, Loader2, Server, Trash2 } from "lucide-svelte";
+  import FieldRow from "$lib/components/inputs/FieldRow.svelte";
+  import { collapse } from "$lib/components/settings/collapse";
+  import { fade, fly, listFlip, scale } from "$lib/motion";
 
   interface ValidationState {
     status: "pending" | "validating" | "valid" | "invalid" | "incomplete";
@@ -16,6 +19,7 @@
     onvalidationchange?: (data: { hasValidServers: boolean }) => void;
     showAdvancedFields?: boolean;
     variant?: "setup" | "settings";
+    restrictedRole?: "upload" | "verify";
   }
 
   let {
@@ -24,6 +28,7 @@
     onvalidationchange,
     showAdvancedFields = false,
     variant = "setup",
+    restrictedRole,
   }: Props = $props();
 
   // Track validation state for each server
@@ -39,6 +44,33 @@
     }
   });
 
+  // Stable identity per server object so rows can be keyed (enter/leave/reorder
+  // motion) while validation state keeps being tracked by index.
+  const serverIds = new WeakMap<object, number>();
+  const defaultOpen = new Map<number, boolean>();
+  let nextServerId = 0;
+  let userToggled = $state<Record<number, boolean>>({});
+
+  function idFor(server: configType.ServerConfig): number {
+    let id = serverIds.get(server);
+    if (id === undefined) {
+      id = nextServerId++;
+      serverIds.set(server, id);
+      // New or empty servers start expanded so they can be filled in right away;
+      // so does a lone server (nothing else competes for space).
+      defaultOpen.set(id, !server.host || localServers.length === 1);
+    }
+    return id;
+  }
+
+  function isOpen(id: number, _server: configType.ServerConfig): boolean {
+    return userToggled[id] ?? defaultOpen.get(id) ?? false;
+  }
+
+  function toggleOpen(id: number, server: configType.ServerConfig): void {
+    userToggled = { ...userToggled, [id]: !isOpen(id, server) };
+  }
+
   // Update servers prop when local state changes
   function updateServers(): void {
     servers = localServers.map((server) => ({ ...server }));
@@ -48,10 +80,15 @@
   function addServer(): void {
     const newServer = new configType.ServerConfig({
       max_connections: 10,
+      inflight: 10,
       max_connection_idle_time_in_seconds: 300,
       max_connection_ttl_in_seconds: 3600,
       insecure_ssl: false,
     });
+
+    if (restrictedRole) {
+      newServer.role = restrictedRole;
+    }
 
     localServers = [...localServers, newServer];
     const newIndex = localServers.length - 1;
@@ -65,6 +102,12 @@
   }
 
   function removeServer(index: number): void {
+    // Prevent removing the last upload server
+    if (restrictedRole === "upload" && localServers.length <= 1) {
+      toastStore.error($t("settings.server.validation.cannot_disable_last"));
+      return;
+    }
+
     localServers = localServers.filter((_, i) => i !== index);
 
     // Rebuild validation states with new indices
@@ -109,24 +152,24 @@
     onServerFieldChange(index);
   }
 
-  function onServerCheckOnlyChange(index: number, checkOnly: boolean): void {
-    // If trying to enable check_only, verify at least one posting server will remain
-    if (checkOnly) {
-      const postingServersCount = localServers.filter((s, i) => {
+  function onServerRoleChange(index: number, role: string): void {
+    // If switching to verify, ensure at least one upload server will remain
+    if (role === "verify") {
+      const uploadServersCount = localServers.filter((s, i) => {
         const isEnabled = s.enabled !== false;
-        const willBeCheckOnly = i === index ? true : (s.check_only === true);
-        return isEnabled && !willBeCheckOnly;
+        const effectiveRole = i === index ? "verify" : (s.role || "upload");
+        return isEnabled && effectiveRole !== "verify";
       }).length;
 
-      if (postingServersCount < 1) {
-        toastStore.error($t("settings.server.validation.cannot_set_all_check_only"));
+      if (uploadServersCount < 1) {
+        toastStore.error($t("settings.server.validation.cannot_set_all_verify"));
         // Revert the change
-        localServers[index].check_only = false;
+        localServers[index].role = "upload";
         return;
       }
     }
 
-    localServers[index].check_only = checkOnly;
+    localServers[index].role = role;
     onServerFieldChange(index);
   }
 
@@ -173,7 +216,7 @@
       toastStore.error($t("settings.server.bulk_operations.cannot_disable_all"));
       return;
     }
-    
+
     localServers.forEach((server, index) => {
       if (server.enabled !== false) {
         localServers[index].enabled = false;
@@ -186,7 +229,6 @@
   let enabledServersCount = $derived(localServers.filter(s => s.enabled !== false).length);
   let totalServersCount = $derived(localServers.length);
   let hasDisabledServers = $derived(localServers.some(s => s.enabled === false));
-  let allServersDisabled = $derived(enabledServersCount === 0);
 
   async function validateServer(index: number): Promise<void> {
     const server = localServers[index];
@@ -195,7 +237,10 @@
     }
 
     // Basic validation first
-    if (!server.host || !server.port) {
+    const host = server.host;
+    const port = server.port;
+
+    if (!host || !port) {
       validationStates = {
         ...validationStates,
         [index]: { status: "incomplete", error: "Host and port are required" },
@@ -211,12 +256,14 @@
 
     try {
       const result = await apiClient.validateNNTPServer({
-        host: server.host,
-        port: server.port,
+        name: server.name || "",
+        host,
+        port,
         username: server.username || "",
         password: server.password || "",
         ssl: server.ssl || false,
         maxConnections: server.max_connections || 10,
+        role: server.role || "upload",
       });
 
       if (result.valid) {
@@ -229,7 +276,6 @@
         return;
       }
 
-      console.log("Setting server", index, "as invalid:", result.error);
       validationStates = {
         ...validationStates,
         [index]: { status: "invalid", error: result.error },
@@ -264,408 +310,437 @@
   });
 </script>
 
-<div class="space-y-6">
+{#snippet statusDot(state: ValidationState, enabled: boolean)}
+  <span
+    class="status-dot"
+    class:status-dot-valid={enabled && state.status === "valid"}
+    class:status-dot-error={enabled && (state.status === "invalid" || state.status === "incomplete")}
+    class:status-dot-busy={enabled && state.status === "validating"}
+    class:status-dot-off={!enabled}
+    aria-hidden="true"
+  ></span>
+{/snippet}
+
+<div class="space-y-4">
   {#if variant === "setup"}
     <div>
-      <h3 class="text-lg font-semibold text-base-content mb-2">
+      <h3 class="text-lg font-semibold text-base-content mb-1">
         {$t("settings.server.title")}
       </h3>
-      <p class="text-base-content/70 mb-4">
+      <p class="text-base-content/70">
         {$t("settings.server.description")}
       </p>
     </div>
   {/if}
 
-  <!-- Status and Bulk Operations -->
-  {#if localServers.length > 0 && variant === "settings"}
-    <div class="flex items-center justify-between p-4 bg-base-200 rounded-lg mb-4">
-      <div class="flex items-center gap-4">
-        <div class="stat">
-          <div class="stat-title text-sm">Providers Status</div>
-          <div class="stat-value text-lg">
-            {enabledServersCount} / {totalServersCount}
-          </div>
-          <div class="stat-desc text-xs">
+  <!-- Status and Bulk Operations (settings variant, no restrictedRole) -->
+  {#if localServers.length > 0 && variant === "settings" && !restrictedRole}
+    <div class="settings-group" transition:collapse>
+      <div class="settings-row">
+        <div>
+          <div class="settings-row-title">Providers Status</div>
+          <div class="settings-row-desc">
+            <span class="tabular-nums">{enabledServersCount} / {totalServersCount}</span>
             {$t("settings.server.status.providers_active")}
           </div>
         </div>
-      </div>
-      
-      <div class="flex gap-2">
-        {#if hasDisabledServers}
-          <button 
-            class="btn btn-sm btn-success"
-            onclick={enableAllServers}
-          >
-            {$t("settings.server.bulk_operations.enable_all")}
-          </button>
-        {/if}
-        {#if enabledServersCount > 1}
-          <button 
-            class="btn btn-sm btn-warning"
-            onclick={disableAllServers}
-          >
-            {$t("settings.server.bulk_operations.disable_all")}
-          </button>
-        {/if}
+        <div class="flex gap-2">
+          {#if hasDisabledServers}
+            <button class="btn btn-sm" onclick={enableAllServers} transition:fade={{ speed: "fast" }}>
+              {$t("settings.server.bulk_operations.enable_all")}
+            </button>
+          {/if}
+          {#if enabledServersCount > 1}
+            <button class="btn btn-sm" onclick={disableAllServers} transition:fade={{ speed: "fast" }}>
+              {$t("settings.server.bulk_operations.disable_all")}
+            </button>
+          {/if}
+        </div>
       </div>
     </div>
   {/if}
 
   {#if localServers.length === 0}
-    <div
-      class="text-center py-8 border-2 border-dashed border-base-300 rounded-lg"
-    >
-      <Server class="w-12 h-12 text-base-content/40 mx-auto mb-4" />
-      <p class="text-base-content/70 mb-4">
-        {$t("settings.server.no_servers_description")}
-      </p>
-      <button type="button" class="btn btn-outline" onclick={addServer}>
+    {#if restrictedRole === "verify"}
+      <!-- Empty verify pool notice -->
+      <div class="settings-group" in:fade={{ speed: "base" }}>
+        <div class="settings-row justify-start gap-3">
+          <Info class="w-4 h-4 text-base-content/60 shrink-0" />
+          <p class="text-sm text-base-content/70">
+            {$t("settings.server.verify_pool_empty_notice")}
+          </p>
+        </div>
+      </div>
+      <button type="button" class="btn btn-sm" onclick={addServer}>
         <CirclePlus class="w-4 h-4" />
-        {$t("settings.server.add_first_server")}
+        {$t("settings.server.add_verify_server")}
       </button>
-    </div>
+    {:else}
+      <div class="settings-group" in:fade={{ speed: "base" }}>
+        <div class="flex flex-col items-center gap-3 px-4 py-8 text-center">
+          <Server class="w-8 h-8 text-base-content/40" />
+          <p class="text-sm text-base-content/70">
+            {$t("settings.server.no_servers_description")}
+          </p>
+          <button type="button" class="btn btn-sm" onclick={addServer}>
+            <CirclePlus class="w-4 h-4" />
+            {$t("settings.server.add_first_server")}
+          </button>
+        </div>
+      </div>
+    {/if}
   {:else}
-    <div class="space-y-4">
-      {#each localServers as server, index}
-        {@const validationState = getServerValidationState(index)}
-        {@const isEnabled = server.enabled !== false}
-        <div class="card bg-base-100 shadow-lg {!isEnabled ? 'opacity-60' : ''}">
-          <div class="card-body p-4">
-            <div class="flex justify-between items-start mb-4">
-              <div class="flex items-center gap-2">
-                <h4 class="font-medium text-base-content">
-                  {$t("settings.server.server_number", {
-                    values: { number: index + 1 },
-                  })}
-                </h4>
-                {#if !isEnabled}
-                  <div class="badge badge-warning">
-                    {$t("settings.server.disabled")}
-                  </div>
+    {#each localServers as server, index (idFor(server))}
+      {@const sid = idFor(server)}
+      {@const validationState = getServerValidationState(index)}
+      {@const isEnabled = server.enabled !== false}
+      {@const open = isOpen(sid, server)}
+      <div
+        class="settings-group"
+        animate:listFlip
+        in:fly={{ y: 10 }}
+        out:fade={{ speed: "fast" }}
+      >
+        <!-- Summary row -->
+        <div class="settings-row server-summary" class:opacity-60={!isEnabled}>
+          <button
+            type="button"
+            class="server-toggle"
+            aria-expanded={open}
+            aria-controls="server-panel-{sid}"
+            onclick={() => toggleOpen(sid, server)}
+          >
+            {@render statusDot(validationState, isEnabled)}
+            <span class="min-w-0 flex-1 text-left">
+              <span class="settings-row-title block truncate">
+                {#if server.name}
+                  {server.name}
+                {:else if restrictedRole === "upload"}
+                  {$t("settings.server.account_number", { values: { number: index + 1 } })}
+                {:else}
+                  {$t("settings.server.server_number", { values: { number: index + 1 } })}
                 {/if}
-                {#if validationState.status === "validating"}
-                  <div class="badge badge-primary gap-1">
-                    <Loader2 class="w-3 h-3 animate-spin" />
-                    {$t("settings.server.validating")}
-                  </div>
-                {:else if validationState.status === "valid"}
-                  <div class="badge badge-success gap-1">
-                    <Check class="w-3 h-3" />
-                    {$t("settings.server.valid")}
-                  </div>
-                {:else if validationState.status === "invalid"}
-                  <div class="badge badge-error">
-                    {$t("settings.server.invalid")}
-                  </div>
-                {:else if validationState.status === "incomplete"}
-                  <div class="badge badge-error">
-                    {$t("settings.server.incomplete")}
-                  </div>
-                {/if}
-              </div>
-              <div class="flex items-center gap-2">
-                {#if validationState.status !== "validating"}
-                  <button
-                    class="btn btn-primary btn-outline btn-sm"
-                    onclick={() => validateServer(index)}
-                  >
-                    {$t("settings.server.test_connection")}
-                  </button>
-                {/if}
-                {#if localServers.length > 1}
-                  <button
-                    class="btn btn-error btn-outline btn-sm"
-                    onclick={() => removeServer(index)}
-                  >
-                    <Trash2 class="w-4 h-4" />
-                  </button>
-                {/if}
-              </div>
-            </div>
+              </span>
+              {#if server.host}
+                <span class="settings-row-desc block truncate">
+                  {server.host}{server.port ? `:${server.port}` : ""}{server.username ? ` · ${server.username}` : ""}
+                </span>
+              {/if}
+            </span>
+          </button>
 
-            {#if validationState.error}
-              <div class="alert alert-error mb-4">
-                <p class="text-sm">
-                  {validationState.error}
-                </p>
+          <div class="flex shrink-0 items-center gap-1.5">
+            {#if !isEnabled}
+              <span class="badge badge-ghost badge-sm" in:fade={{ speed: "fast" }}>
+                {$t("settings.server.disabled")}
+              </span>
+            {/if}
+            {#key validationState.status}
+              {#if validationState.status === "validating"}
+                <span class="inline-flex items-center gap-1 text-xs text-base-content/70" in:fade={{ speed: "fast" }}>
+                  <Loader2 class="w-3 h-3 animate-spin" />
+                  {$t("settings.server.validating")}
+                </span>
+              {:else if validationState.status === "valid"}
+                <span class="inline-flex items-center gap-1 text-xs text-success" in:scale={{ speed: "fast", start: 0.85 }}>
+                  <Check class="w-3 h-3" />
+                  {$t("settings.server.valid")}
+                </span>
+              {:else if validationState.status === "invalid"}
+                <span class="text-xs text-error" in:fade={{ speed: "fast" }}>
+                  {$t("settings.server.invalid")}
+                </span>
+              {:else if validationState.status === "incomplete"}
+                <span class="text-xs text-error" in:fade={{ speed: "fast" }}>
+                  {$t("settings.server.incomplete")}
+                </span>
+              {/if}
+            {/key}
+            {#if validationState.status !== "validating"}
+              <button class="btn btn-sm" onclick={() => validateServer(index)}>
+                {$t("settings.server.test_connection")}
+              </button>
+            {/if}
+            {#if restrictedRole === "upload" ? localServers.length > 1 : localServers.length > 0}
+              <button
+                class="btn btn-sm btn-ghost btn-square text-error"
+                onclick={() => removeServer(index)}
+                aria-label={$t("settings.server.remove")}
+                title={$t("settings.server.remove")}
+              >
+                <Trash2 class="w-4 h-4" />
+              </button>
+            {/if}
+            <ChevronDown
+              class="w-4 h-4 text-base-content/50 transition-transform duration-(--motion-base) {open ? 'rotate-180' : ''}"
+            />
+          </div>
+        </div>
+
+        {#if validationState.error}
+          <div transition:collapse class="border-t border-(--ui-hairline)" role="alert">
+            <p class="px-4 py-2.5 text-sm text-error">{validationState.error}</p>
+          </div>
+        {/if}
+
+        {#if open}
+          <div id="server-panel-{sid}" transition:collapse class="border-t border-(--ui-hairline)">
+            {#if variant === "settings" && server.enabled !== undefined}
+              <FieldRow
+                label={$t("settings.server.enabled")}
+                description={isEnabled
+                  ? $t("settings.server.enabled_description")
+                  : $t("settings.server.disabled_description")}
+                id="server-enabled-{index}"
+              >
+                <input
+                  id="server-enabled-{index}"
+                  type="checkbox"
+                  class="toggle toggle-primary"
+                  checked={localServers[index].enabled !== false}
+                  onchange={(e) => onServerEnabledChange(index, (e.target as HTMLInputElement).checked)}
+                />
+              </FieldRow>
+            {/if}
+
+            <!-- Server Role selector — only shown in legacy/setup mode (no restrictedRole) -->
+            {#if !restrictedRole}
+              <FieldRow
+                label={$t("settings.server.role")}
+                description={(localServers[index].role || "upload") === "verify"
+                  ? $t("settings.server.role_verify_description")
+                  : $t("settings.server.role_upload_description")}
+                id="server-role-{index}"
+              >
+                <div class="flex items-center gap-2">
+                  {#if (localServers[index].role || "upload") === "verify"}
+                    <span class="badge badge-ghost badge-sm" in:fade={{ speed: "fast" }}>
+                      {$t("settings.server.role_verify_badge")}
+                    </span>
+                  {/if}
+                  <select
+                    id="server-role-{index}"
+                    class="select select-sm w-auto"
+                    value={localServers[index].role || "upload"}
+                    onchange={(e) => onServerRoleChange(index, (e.target as HTMLSelectElement).value)}
+                  >
+                    <option value="upload">{$t("settings.server.role_upload")}</option>
+                    <option value="verify">{$t("settings.server.role_verify")}</option>
+                  </select>
+                </div>
+              </FieldRow>
+            {/if}
+
+            <FieldRow label={$t("settings.server.name")} id="name-{index}">
+              <input
+                id="name-{index}"
+                class="input input-sm w-64 max-sm:w-full"
+                bind:value={localServers[index].name}
+                placeholder={$t("settings.server.name_placeholder")}
+                oninput={() => onServerFieldChange(index)}
+              />
+            </FieldRow>
+
+            <FieldRow label={`${$t("settings.server.host")} *`} id="host-{index}">
+              <input
+                id="host-{index}"
+                class="input input-sm w-64 max-sm:w-full"
+                bind:value={localServers[index].host}
+                placeholder="news.example.com"
+                required
+                oninput={() => onServerFieldChange(index)}
+              />
+            </FieldRow>
+
+            <FieldRow label={`${$t("settings.server.port")} *`} id="port-{index}">
+              <input
+                id="port-{index}"
+                class="input input-sm w-28 text-right tabular-nums"
+                type="number"
+                bind:value={localServers[index].port}
+                min="1"
+                max="65535"
+                required
+                oninput={() => onServerFieldChange(index)}
+              />
+            </FieldRow>
+
+            <FieldRow label={$t("settings.server.use_ssl_tls")} id="ssl-{index}">
+              <input
+                id="ssl-{index}"
+                type="checkbox"
+                class="toggle toggle-primary"
+                bind:checked={localServers[index].ssl}
+                onchange={() => onServerFieldChange(index)}
+              />
+            </FieldRow>
+
+            {#if variant === "settings" && showAdvancedFields}
+              <div transition:collapse>
+                <FieldRow label={$t("settings.server.allow_insecure_ssl")} id="insecure-ssl-{index}">
+                  <input
+                    id="insecure-ssl-{index}"
+                    type="checkbox"
+                    class="toggle toggle-primary"
+                    bind:checked={localServers[index].insecure_ssl}
+                    onchange={() => onServerFieldChange(index)}
+                  />
+                </FieldRow>
               </div>
             {/if}
 
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {#if variant === "settings" && server.enabled !== undefined}
-                <div class="md:col-span-2">
-                  <div class="flex items-center gap-3 p-3 bg-base-200 rounded-lg">
-                    <input
-                      id="server-enabled-{index}"
-                      type="checkbox"
-                      class="checkbox checkbox-primary"
-                      checked={localServers[index].enabled !== false}
-                      onchange={(e) => onServerEnabledChange(index, (e.target as HTMLInputElement).checked)}
-                    />
-                    <label
-                      for="server-enabled-{index}"
-                      class="label-text cursor-pointer flex-1"
-                    >
-                      <span class="font-medium">{$t("settings.server.enabled")}</span>
-                      <p class="text-sm opacity-70">
-                        {isEnabled
-                          ? $t("settings.server.enabled_description")
-                          : $t("settings.server.disabled_description")
-                        }
-                      </p>
-                    </label>
-                  </div>
-                </div>
-              {/if}
+            <FieldRow label={$t("settings.server.username")} id="username-{index}">
+              <input
+                id="username-{index}"
+                class="input input-sm w-64 max-sm:w-full"
+                autocomplete="off"
+                bind:value={localServers[index].username}
+                oninput={() => onServerFieldChange(index)}
+              />
+            </FieldRow>
 
-              <!-- Check Only toggle - shown in both setup and settings -->
-              {#if variant === "settings"}
-                {@const isCheckOnly = localServers[index].check_only === true}
-                <div class="md:col-span-2">
-                  <div class="flex items-center gap-3 p-3 bg-base-200 rounded-lg {isCheckOnly ? 'border border-info' : ''}">
-                    <input
-                      id="server-check-only-{index}"
-                      type="checkbox"
-                      class="checkbox checkbox-info"
-                      checked={isCheckOnly}
-                      onchange={(e) => onServerCheckOnlyChange(index, (e.target as HTMLInputElement).checked)}
-                    />
-                    <label
-                      for="server-check-only-{index}"
-                      class="label-text cursor-pointer flex-1"
-                    >
-                      <span class="font-medium">{$t("settings.server.check_only")}</span>
-                      <p class="text-sm opacity-70">
-                        {isCheckOnly
-                          ? $t("settings.server.check_only_enabled_description")
-                          : $t("settings.server.check_only_description")
-                        }
-                      </p>
-                    </label>
-                    {#if isCheckOnly}
-                      <div class="badge badge-info badge-sm">
-                        {$t("settings.server.check_only_badge")}
-                      </div>
-                    {/if}
-                  </div>
-                </div>
-              {:else if variant === "setup"}
-                {@const isCheckOnly = localServers[index].check_only === true}
-                <div class="md:col-span-2">
-                  <div class="flex items-center gap-3 p-3 bg-base-200 rounded-lg {isCheckOnly ? 'border border-info' : ''}">
-                    <input
-                      id="server-check-only-{index}"
-                      type="checkbox"
-                      class="checkbox checkbox-info"
-                      checked={isCheckOnly}
-                      onchange={(e) => onServerCheckOnlyChange(index, (e.target as HTMLInputElement).checked)}
-                    />
-                    <label
-                      for="server-check-only-{index}"
-                      class="label-text cursor-pointer flex-1"
-                    >
-                      <span class="font-medium">{$t("settings.server.check_only")}</span>
-                      <p class="text-sm opacity-70">
-                        {$t("settings.server.check_only_description")}
-                      </p>
-                    </label>
-                    {#if isCheckOnly}
-                      <div class="badge badge-info badge-sm">
-                        {$t("settings.server.check_only_badge")}
-                      </div>
-                    {/if}
-                  </div>
-                </div>
-              {/if}
+            <FieldRow label={$t("settings.server.password")} id="password-{index}">
+              <input
+                id="password-{index}"
+                class="input input-sm w-64 max-sm:w-full"
+                type="password"
+                autocomplete="new-password"
+                bind:value={localServers[index].password}
+                oninput={() => onServerFieldChange(index)}
+              />
+            </FieldRow>
 
-              <div>
-                <label for="host-{index}" class="label">
-                  <span class="label-text">
-                    {$t("settings.server.host")} *
-                  </span>
-                </label>
-                <input
-                  id="host-{index}"
-                  class="input input-bordered w-full"
-                  bind:value={localServers[index].host}
-                  placeholder="news.example.com"
-                  required
-                  oninput={() => onServerFieldChange(index)}
-                />
-              </div>
+            <FieldRow label={$t("settings.server.max_connections")} id="maxConnections-{index}">
+              <input
+                id="maxConnections-{index}"
+                class="input input-sm w-28 text-right tabular-nums"
+                type="number"
+                bind:value={localServers[index].max_connections}
+                min="1"
+                max="50"
+                oninput={() => onServerFieldChange(index)}
+              />
+            </FieldRow>
 
-              <div>
-                <label for="port-{index}" class="label">
-                  <span class="label-text">
-                    {$t("settings.server.port")} *
-                  </span>
-                </label>
-                <input
-                  id="port-{index}"
-                  class="input input-bordered w-full"
-                  type="number"
-                  bind:value={localServers[index].port}
-                  min="1"
-                  max="65535"
-                  required
-                  oninput={() => onServerFieldChange(index)}
-                />
-              </div>
-
-              <div class="flex items-center space-x-4 pt-2">
-                <div class="flex items-center">
+            {#if variant === "settings" && showAdvancedFields}
+              <div transition:collapse>
+                <FieldRow
+                  label={$t("settings.server.inflight")}
+                  description={$t("settings.server.inflight_description")}
+                  id="inflight-{index}"
+                >
                   <input
-                    type="checkbox"
-                    class="checkbox mr-2"
-                    bind:checked={localServers[index].ssl}
-                    onchange={() => onServerFieldChange(index)}
+                    id="inflight-{index}"
+                    class="input input-sm w-28 text-right tabular-nums"
+                    type="number"
+                    bind:value={localServers[index].inflight}
+                    min="0"
+                    max="100"
+                    placeholder="0"
+                    oninput={() => onServerFieldChange(index)}
                   />
-                  <label for="ssl-{index}" class="label-text cursor-pointer">
-                    {$t("settings.server.use_ssl_tls")}
-                  </label>
-                </div>
-
-                {#if variant === "settings" && showAdvancedFields}
-                  <div class="flex items-center">
-                    <input
-                      type="checkbox"
-                      class="checkbox mr-2"
-                      bind:checked={localServers[index].insecure_ssl}
-                      onchange={() => onServerFieldChange(index)}
-                    />
-                    <label
-                      for="insecure-ssl-{index}"
-                      class="label-text cursor-pointer"
-                    >
-                      {$t("settings.server.allow_insecure_ssl")}
-                    </label>
-                  </div>
-                {/if}
-              </div>
-
-              <div>
-                <label for="username-{index}" class="label">
-                  <span class="label-text">
-                    {$t("settings.server.username")}
-                  </span>
-                </label>
-                <input
-                  id="username-{index}"
-                  class="input input-bordered w-full"
-                  bind:value={localServers[index].username}
-                  oninput={() => onServerFieldChange(index)}
-                />
-              </div>
-
-              <div>
-                <label for="password-{index}" class="label">
-                  <span class="label-text">
-                    {$t("settings.server.password")}
-                  </span>
-                </label>
-                <input
-                  id="password-{index}"
-                  class="input input-bordered w-full"
-                  type="password"
-                  bind:value={localServers[index].password}
-                  oninput={() => onServerFieldChange(index)}
-                />
-              </div>
-
-              <div>
-                <label for="maxConnections-{index}" class="label">
-                  <span class="label-text">
-                    {$t("settings.server.max_connections")}
-                  </span>
-                </label>
-                <input
-                  id="maxConnections-{index}"
-                  class="input input-bordered w-full"
-                  type="number"
-                  bind:value={localServers[index].max_connections}
-                  min="1"
-                  max="50"
-                  oninput={() => onServerFieldChange(index)}
-                />
-              </div>
-
-              {#if variant === "settings" && showAdvancedFields}
-                <div>
-                  <label for="idle-time-{index}" class="label">
-                    <span class="label-text"
-                      >{$t("settings.server.connection_idle_timeout")}</span
-                    >
-                  </label>
+                </FieldRow>
+                <FieldRow
+                  label={$t("settings.server.connection_idle_timeout")}
+                  description={$t("settings.server.connection_idle_timeout_description")}
+                  id="idle-time-{index}"
+                >
                   <input
                     id="idle-time-{index}"
                     type="number"
-                    class="input input-bordered w-full"
-                    bind:value={
-                      localServers[index].max_connection_idle_time_in_seconds
-                    }
+                    class="input input-sm w-28 text-right tabular-nums"
+                    bind:value={localServers[index].max_connection_idle_time_in_seconds}
                     min="1"
                     max="3600"
                     placeholder="300"
                     onchange={() => onServerFieldChange(index)}
                   />
-                  <p class="text-sm text-base-content/70 mt-1">
-                    {$t("settings.server.connection_idle_timeout_description")}
-                  </p>
-                </div>
-
-                <div>
-                  <label for="ttl-{index}" class="label">
-                    <span class="label-text"
-                      >{$t("settings.server.connection_ttl")}</span
-                    >
-                  </label>
+                </FieldRow>
+                <FieldRow
+                  label={$t("settings.server.connection_ttl")}
+                  description={$t("settings.server.connection_ttl_description")}
+                  id="ttl-{index}"
+                >
                   <input
                     id="ttl-{index}"
                     type="number"
-                    class="input input-bordered w-full"
-                    bind:value={
-                      localServers[index].max_connection_ttl_in_seconds
-                    }
+                    class="input input-sm w-28 text-right tabular-nums"
+                    bind:value={localServers[index].max_connection_ttl_in_seconds}
                     min="1"
                     max="86400"
                     placeholder="3600"
                     onchange={() => onServerFieldChange(index)}
                   />
-                  <p class="text-sm text-base-content/70 mt-1">
-                    {$t("settings.server.connection_ttl_description")}
-                  </p>
-                </div>
-              {/if}
-
-              <!-- Proxy URL Field -->
-              <div>
-                <label for="proxy-url-{index}" class="label">
-                  <span class="label-text">
-                    {$t("settings.server.proxy.url_label")}
-                  </span>
-                </label>
-                <input
-                  id="proxy-url-{index}"
-                  type="text"
-                  class="input input-bordered w-full"
-                  bind:value={localServers[index].proxy_url}
-                  placeholder="socks5://user:pass@proxy.example.com:1080"
-                  oninput={() => onServerFieldChange(index)}
-                />
-                <p class="text-sm text-base-content/70 mt-1">
-                  {$t("settings.server.proxy.url_description")}
-                </p>
+                </FieldRow>
               </div>
-            </div>
-          </div>
-        </div>
-      {/each}
-    </div>
+            {/if}
 
-    <button class="btn btn-outline w-full" onclick={addServer}>
-      <CirclePlus class="w-4 h-4 mr-2" />
-      {$t("settings.server.add_server")}
+            <FieldRow
+              label={$t("settings.server.proxy.url_label")}
+              description={$t("settings.server.proxy.url_description")}
+              id="proxy-url-{index}"
+            >
+              <input
+                id="proxy-url-{index}"
+                type="text"
+                class="input input-sm w-64 max-sm:w-full"
+                bind:value={localServers[index].proxy_url}
+                placeholder="socks5://user:pass@proxy.example.com:1080"
+                oninput={() => onServerFieldChange(index)}
+              />
+            </FieldRow>
+          </div>
+        {/if}
+      </div>
+    {/each}
+
+    <button class="btn btn-sm" onclick={addServer}>
+      <CirclePlus class="w-4 h-4" />
+      {#if restrictedRole === "upload"}
+        {$t("settings.server.add_account")}
+      {:else if restrictedRole === "verify"}
+        {$t("settings.server.add_verify_server")}
+      {:else}
+        {$t("settings.server.add_server")}
+      {/if}
     </button>
   {/if}
 </div>
+
+<style>
+  .server-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex: 1 1 0;
+    min-width: 0;
+    cursor: pointer;
+    text-align: left;
+  }
+  .status-dot {
+    flex: none;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 9999px;
+    background: color-mix(in oklab, var(--color-base-content) 30%, transparent);
+    transition: background-color var(--motion-base) var(--ease-standard);
+  }
+  .status-dot-valid {
+    background: var(--color-success);
+  }
+  .status-dot-error {
+    background: var(--color-error);
+  }
+  .status-dot-busy {
+    background: var(--color-primary);
+    animation: pulse-soft 1.2s var(--ease-standard) infinite;
+  }
+  .status-dot-off {
+    background: color-mix(in oklab, var(--color-base-content) 18%, transparent);
+  }
+  @media (max-width: 40rem) {
+    .server-summary {
+      flex-wrap: wrap;
+    }
+  }
+</style>

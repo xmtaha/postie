@@ -14,7 +14,7 @@ import (
 	time "time"
 
 	uuid "github.com/google/uuid"
-	progress "github.com/javi11/postie/internal/progress"
+	progress "github.com/kipsilabs/postie/internal/progress"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -348,6 +348,18 @@ func (m *MockProgress) SetPaused(paused bool) {
 func (mr *MockProgressMockRecorder) SetPaused(paused any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetPaused", reflect.TypeOf((*MockProgress)(nil).SetPaused), paused)
+}
+
+// SetWaitDeadline mocks base method.
+func (m *MockProgress) SetWaitDeadline(deadline time.Time) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "SetWaitDeadline", deadline)
+}
+
+// SetWaitDeadline indicates an expected call of SetWaitDeadline.
+func (mr *MockProgressMockRecorder) SetWaitDeadline(deadline any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetWaitDeadline", reflect.TypeOf((*MockProgress)(nil).SetWaitDeadline), deadline)
 }
 
 // UpdateProgress mocks base method.

@@ -8,34 +8,41 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/javi11/postie/internal/database"
-	"github.com/javi11/postie/internal/queue"
+	"github.com/kipsilabs/postie/internal/apikey"
+	"github.com/kipsilabs/postie/internal/database"
+	"github.com/kipsilabs/postie/internal/queue"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // QueueItem represents a queue item for the frontend - matches queue.QueueItem
 type QueueItem struct {
-	ID           string     `json:"id"`
-	Path         string     `json:"path"`
-	FileName     string     `json:"fileName"`
-	Size         int64      `json:"size"`
-	Status       string     `json:"status"`
-	RetryCount   int        `json:"retryCount"`
-	Priority     int        `json:"priority"`
-	ErrorMessage *string    `json:"errorMessage"`
-	CreatedAt    time.Time  `json:"createdAt"`
-	UpdatedAt    time.Time  `json:"updatedAt"`
-	CompletedAt  *time.Time `json:"completedAt"`
-	NzbPath      *string    `json:"nzbPath"`
+	ID                 string     `json:"id"`
+	Path               string     `json:"path"`
+	FileName           string     `json:"fileName"`
+	Size               int64      `json:"size"`
+	Status             string     `json:"status"`
+	RetryCount         int        `json:"retryCount"`
+	Priority           int        `json:"priority"`
+	ErrorMessage       *string    `json:"errorMessage"`
+	CreatedAt          time.Time  `json:"createdAt"`
+	UpdatedAt          time.Time  `json:"updatedAt"`
+	CompletedAt        *time.Time `json:"completedAt"`
+	NzbPath            *string    `json:"nzbPath"`
+	VerificationStatus *string    `json:"verificationStatus"`
+	// Deferred verification progress (only set while pending_verification)
+	VerifiedArticles *int `json:"verifiedArticles,omitempty"`
+	TotalArticles    *int `json:"totalArticles,omitempty"`
 }
 
 // QueueStats represents queue statistics
 type QueueStats struct {
-	Total    int `json:"total"`
-	Pending  int `json:"pending"`
-	Running  int `json:"running"`
-	Complete int `json:"complete"`
-	Error    int `json:"error"`
+	Total               int `json:"total"`
+	Pending             int `json:"pending"`
+	Running             int `json:"running"`
+	Complete            int `json:"complete"`
+	Error               int `json:"error"`
+	PendingVerification int `json:"pendingVerification"`
+	VerificationFailed  int `json:"verificationFailed"`
 }
 
 // PaginationParams defines parameters for paginated queries
@@ -107,6 +114,14 @@ func (a *App) initializeQueue() error {
 		return fmt.Errorf("failed to create queue: %w", err)
 	}
 
+	// Generate the HTTP API key on first start when the API is enabled so the
+	// gated upload endpoint always has something to validate against.
+	if a.config != nil && a.config.GetAPIConfig().Enabled {
+		if _, keyErr := apikey.EnsureKey(a.procCtx, apikey.NewSQLStore(db.DB)); keyErr != nil {
+			slog.Warn("failed to ensure API key", "error", keyErr)
+		}
+	}
+
 	slog.Info("Queue initialized successfully")
 	return nil
 }
@@ -143,7 +158,7 @@ func (a *App) AddFilesToQueue() error {
 		}
 
 		// Add file directly to queue
-		if err := a.queue.AddFile(context.Background(), filePath, info.Size()); err != nil {
+		if err := a.queue.AddManualFile(context.Background(), filePath, info.Size()); err != nil {
 			slog.Warn("Could not add file to queue, skipping", "file", filePath, "error", err)
 			continue
 		}
@@ -198,18 +213,21 @@ func (a *App) GetQueueItems(params PaginationParams) (*PaginatedQueueResult, err
 	var items []QueueItem
 	for _, queueItem := range result.Items {
 		item := QueueItem{
-			ID:           queueItem.ID,
-			Path:         queueItem.Path,
-			FileName:     queueItem.FileName,
-			Size:         queueItem.Size,
-			Status:       queueItem.Status,
-			RetryCount:   queueItem.RetryCount,
-			Priority:     queueItem.Priority,
-			ErrorMessage: queueItem.ErrorMessage,
-			CreatedAt:    queueItem.CreatedAt,
-			UpdatedAt:    queueItem.UpdatedAt,
-			CompletedAt:  queueItem.CompletedAt,
-			NzbPath:      queueItem.NzbPath,
+			ID:                 queueItem.ID,
+			Path:               queueItem.Path,
+			FileName:           queueItem.FileName,
+			Size:               queueItem.Size,
+			Status:             queueItem.Status,
+			RetryCount:         queueItem.RetryCount,
+			Priority:           queueItem.Priority,
+			ErrorMessage:       queueItem.ErrorMessage,
+			CreatedAt:          queueItem.CreatedAt,
+			UpdatedAt:          queueItem.UpdatedAt,
+			CompletedAt:        queueItem.CompletedAt,
+			NzbPath:            queueItem.NzbPath,
+			VerificationStatus: queueItem.VerificationStatus,
+			VerifiedArticles:   queueItem.VerifiedArticles,
+			TotalArticles:      queueItem.TotalArticles,
 		}
 		items = append(items, item)
 	}
@@ -231,6 +249,10 @@ func (a *App) RemoveFromQueue(id string) error {
 		return fmt.Errorf("queue not initialized")
 	}
 
+	if a.processor != nil {
+		stopRunningJob(a.processor, id)
+	}
+
 	err := a.queue.RemoveFromQueue(id)
 	if err != nil {
 		return err
@@ -246,7 +268,7 @@ func (a *App) RemoveFromQueue(id string) error {
 }
 
 // DebugQueueItem returns debug information about a queue item
-func (a *App) DebugQueueItem(id string) (map[string]interface{}, error) {
+func (a *App) DebugQueueItem(id string) (map[string]any, error) {
 	if a.queue == nil {
 		return nil, fmt.Errorf("queue not initialized")
 	}
@@ -274,6 +296,11 @@ func (a *App) ClearQueue() error {
 	return nil
 }
 
+// queueStatsCacheTTL bounds how often GetQueueStats hits the database. Stats
+// are polled by every open dashboard; without a cache the COUNT queries pile
+// up behind upload writes on the single SQLite connection under load.
+const queueStatsCacheTTL = 2 * time.Second
+
 // GetQueueStats returns statistics about the queue via queue
 func (a *App) GetQueueStats() (QueueStats, error) {
 	if a.queue == nil {
@@ -286,6 +313,12 @@ func (a *App) GetQueueStats() (QueueStats, error) {
 		}, nil
 	}
 
+	a.queueStatsMux.Lock()
+	defer a.queueStatsMux.Unlock()
+	if time.Since(a.queueStatsCachedAt) < queueStatsCacheTTL {
+		return a.queueStatsCached, nil
+	}
+
 	stats, err := a.queue.GetQueueStats()
 	if err != nil {
 		return QueueStats{}, err
@@ -294,7 +327,9 @@ func (a *App) GetQueueStats() (QueueStats, error) {
 	// Convert map[string]interface{} to QueueStats struct
 	queueStats := QueueStats{}
 
-	if total, ok := stats["total"].(int); ok {
+	// The dashboard card reads "Total Items"; the queue's own "total" is only
+	// the live backlog, which drops to 0 the moment a batch finishes.
+	if total, ok := stats["total_including_completed"].(int); ok {
 		queueStats.Total = total
 	}
 	if pending, ok := stats["pending"].(int); ok {
@@ -309,7 +344,15 @@ func (a *App) GetQueueStats() (QueueStats, error) {
 	if errorCount, ok := stats["error"].(int); ok {
 		queueStats.Error = errorCount
 	}
+	if pv, ok := stats["pendingVerification"].(int); ok {
+		queueStats.PendingVerification = pv
+	}
+	if vf, ok := stats["verificationFailed"].(int); ok {
+		queueStats.VerificationFailed = vf
+	}
 
+	a.queueStatsCached = queueStats
+	a.queueStatsCachedAt = time.Now()
 	return queueStats, nil
 }
 
@@ -411,7 +454,7 @@ func (a *App) SetQueueItemPriority(id string, priority int) error {
 // Database migration methods exposed through the App
 
 // GetMigrationStatus returns the current migration status
-func (a *App) GetMigrationStatus() (map[string]interface{}, error) {
+func (a *App) GetMigrationStatus() (map[string]any, error) {
 	if a.database == nil {
 		return nil, fmt.Errorf("database not initialized")
 	}
@@ -422,7 +465,7 @@ func (a *App) GetMigrationStatus() (map[string]interface{}, error) {
 		return nil, err
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"currentVersion": status.CurrentVersion,
 	}, nil
 }
@@ -485,4 +528,20 @@ func (a *App) RecreateDatabase() error {
 
 	migrationRunner := a.database.GetMigrationRunner()
 	return migrationRunner.RecreateDatabase()
+}
+
+type jobController interface {
+	GetRunningJobs() map[string]bool
+	CancelJob(jobID string) error
+}
+
+// A running job keeps uploading after its tracking row is deleted and then
+// re-creates a completed row, so removal is only final once the job is stopped.
+func stopRunningJob(jobs jobController, id string) {
+	if !jobs.GetRunningJobs()[id] {
+		return
+	}
+	if err := jobs.CancelJob(id); err != nil {
+		slog.Warn("Failed to cancel running job before removal", "id", id, "error", err)
+	}
 }

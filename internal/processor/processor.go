@@ -7,20 +7,22 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"encoding/json"
 
-	"github.com/javi11/postie/internal/config"
-	"github.com/javi11/postie/internal/pausable"
-	"github.com/javi11/postie/internal/pool"
-	"github.com/javi11/postie/internal/poster"
-	"github.com/javi11/postie/internal/progress"
-	"github.com/javi11/postie/internal/queue"
-	"github.com/javi11/postie/pkg/fileinfo"
-	"github.com/javi11/postie/pkg/postie"
+	"github.com/kipsilabs/postie/internal/config"
+	"github.com/kipsilabs/postie/internal/pausable"
+	"github.com/kipsilabs/postie/internal/pool"
+	"github.com/kipsilabs/postie/internal/poster"
+	"github.com/kipsilabs/postie/internal/progress"
+	"github.com/kipsilabs/postie/internal/queue"
+	"github.com/kipsilabs/postie/internal/transferstore"
+	"github.com/kipsilabs/postie/pkg/fileinfo"
+	"github.com/kipsilabs/postie/pkg/postie"
 	"maragu.dev/goqite"
 )
 
@@ -32,13 +34,14 @@ type Processor struct {
 	cfg          config.QueueConfig
 	poolManager  *pool.Manager
 	outputFolder string
-	isRunning    bool
+	slots        *slotRunner
 	runningMux   sync.Mutex
 	// Track running jobs and their contexts for cancellation
 	runningJobs               map[string]*RunningJob
 	jobsMux                   sync.RWMutex
 	jobsWg                    sync.WaitGroup // WaitGroup to track running jobs
 	deleteOriginalFile        bool
+	deleteDelay               time.Duration
 	maintainOriginalExtension bool
 	watchFolder               string // Path to the watch folder for maintaining folder structure
 	followSymlinks            bool   // Control whether to follow symlinks when collecting folder files
@@ -50,18 +53,30 @@ type Processor struct {
 	isPaused  bool
 	pausedMux sync.RWMutex
 	// Auto-pause functionality
-	isAutoPaused        bool
-	autoPauseReason     string
-	autoPausedMux       sync.RWMutex
-	providerCheckTicker *time.Ticker
-	providerCheckCtx    context.Context
-	providerCheckCancel context.CancelFunc
+	isAutoPaused          bool
+	autoPauseReason       string
+	isAutoBlockingNewJobs bool // blocks new jobs without pausing running ones
+	autoPausedMux         sync.RWMutex
+	providerCheckTicker   *time.Ticker
+	// providerErrorBaseline holds each provider's cumulative error count as of
+	// the previous availability check. Only touched by the monitor goroutine.
+	providerErrorBaseline map[string]int64
+	providerCheckCtx      context.Context
+	providerCheckCancel   context.CancelFunc
 	// Callback to check if processor can start new items
 	canProcessNextItem func() bool
 	// Callback when job fails permanently
 	onJobError func(fileName, errorMessage string)
+	// Callback when any job finishes (success or deferred)
+	onJobComplete func()
 	// Shutdown flag to prevent new operations during close
 	isShuttingDown bool
+	// transferRuntime owns process-wide upload resources (currently the PAR2
+	// scheduler) shared by every job, so limits hold regardless of queue
+	// concurrency. May be nil, in which case each Postie uses private resources.
+	transferRuntime *postie.Runtime
+	// startVerificationOnce guards starting the durable verification service.
+	startVerificationOnce sync.Once
 }
 
 type ProcessorOptions struct {
@@ -71,11 +86,13 @@ type ProcessorOptions struct {
 	PoolManager               *pool.Manager
 	OutputFolder              string
 	DeleteOriginalFile        bool
+	DeleteDelay               time.Duration // delay before deleting original files
 	MaintainOriginalExtension bool
 	WatchFolder               string
-	FollowSymlinks            bool                            // Control whether to follow symlinks when collecting folder files
-	CanProcessNextItem        func() bool                     // Callback to check if processor can start new items
+	FollowSymlinks            bool                                // Control whether to follow symlinks when collecting folder files
+	CanProcessNextItem        func() bool                         // Callback to check if processor can start new items
 	OnJobError                func(fileName, errorMessage string) // Callback when job fails permanently
+	OnJobComplete             func()                              // Callback when any job finishes (success or deferred)
 }
 type RunningJobDetails struct {
 	ID       string                   `json:"id"`
@@ -102,6 +119,7 @@ func New(opts ProcessorOptions) *Processor {
 	providerCtx, providerCancel := context.WithCancel(context.Background())
 
 	processor := &Processor{
+		slots:                     newSlotRunner(),
 		queue:                     opts.Queue,
 		config:                    opts.Config,
 		cfg:                       opts.QueueConfig,
@@ -110,6 +128,7 @@ func New(opts ProcessorOptions) *Processor {
 		runningJobs:               make(map[string]*RunningJob),
 		reservedPaths:             make(map[string]time.Time),
 		deleteOriginalFile:        opts.DeleteOriginalFile,
+		deleteDelay:               opts.DeleteDelay,
 		maintainOriginalExtension: opts.MaintainOriginalExtension,
 		watchFolder:               opts.WatchFolder,
 		followSymlinks:            opts.FollowSymlinks,
@@ -117,6 +136,36 @@ func New(opts ProcessorOptions) *Processor {
 		providerCheckCancel:       providerCancel,
 		canProcessNextItem:        opts.CanProcessNextItem,
 		onJobError:                opts.OnJobError,
+		onJobComplete:             opts.OnJobComplete,
+	}
+
+	// Create the process-wide transfer runtime so resource limits (PAR2
+	// concurrency today, upload engine and verification later) hold regardless
+	// of queue concurrency. On failure, fall back to per-job resources so the
+	// processor still functions.
+	if opts.Config != nil {
+		// Durable transfer store + manifest dir enable manifest recording and
+		// crash-safe verification. Manifests live alongside the database file.
+		var transferStore *transferstore.Store
+		var manifestDir string
+		if opts.Queue != nil {
+			if db := opts.Queue.DB(); db != nil {
+				transferStore = transferstore.New(db)
+				manifestDir = filepath.Join(filepath.Dir(opts.Config.GetDatabaseConfig().DatabasePath), "transfer-manifests")
+				// One-time migration of pre-durable deferred checks into the
+				// durable verification_failures table (STAT-only).
+				if migrated, err := transferStore.MigrateLegacyPendingChecks(providerCtx); err != nil {
+					slog.Warn("Failed to migrate legacy pending article checks", "error", err)
+				} else if migrated > 0 {
+					slog.Info("Migrated legacy pending article checks to durable verification", "count", migrated)
+				}
+			}
+		}
+		if rt, err := postie.NewRuntime(providerCtx, opts.Config, opts.PoolManager, transferStore, manifestDir, opts.Queue); err != nil {
+			slog.Error("Failed to create transfer runtime; falling back to per-job PAR2 scheduling", "error", err)
+		} else {
+			processor.transferRuntime = rt
+		}
 	}
 
 	// Start provider availability monitoring if we have a pool manager
@@ -129,8 +178,24 @@ func New(opts ProcessorOptions) *Processor {
 
 // Start begins processing files from the queue
 func (p *Processor) Start(ctx context.Context) error {
+	// Start the durable verification service once. It runs independently of the
+	// queue processing loop (and of pause), verifying completed transfers and
+	// re-posting missing articles in the background. No-op when no runtime/store.
+	p.startVerificationOnce.Do(func() {
+		if p.transferRuntime != nil {
+			go p.transferRuntime.RunVerification(ctx)
+			go p.transferRuntime.RunPar2Sweeper(ctx)
+		}
+	})
+
 	processTicker := time.NewTicker(time.Second * 2) // Process queue frequently
 	defer processTicker.Stop()
+
+	// Diagnostic watchdog: periodically log goroutine count and heap usage at
+	// debug level so silent OOM-kills (e.g. on memory-constrained NAS hosts)
+	// leave a trend line in the logs before the process dies. See issue #184.
+	watchdogTicker := time.NewTicker(10 * time.Second)
+	defer watchdogTicker.Stop()
 
 	// Main processing loop
 	for {
@@ -141,6 +206,20 @@ func (p *Processor) Start(ctx context.Context) error {
 			if err := p.processQueueItems(ctx); err != nil {
 				slog.ErrorContext(ctx, "Error processing queue", "error", err)
 			}
+		case <-p.slots.wake:
+			// An item finished: refill its slot now instead of at the next tick.
+			if err := p.processQueueItems(ctx); err != nil {
+				slog.ErrorContext(ctx, "Error processing queue", "error", err)
+			}
+		case <-watchdogTicker.C:
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			slog.DebugContext(ctx, "Runtime watchdog",
+				"goroutines", runtime.NumGoroutine(),
+				"heap_alloc_bytes", ms.HeapAlloc,
+				"heap_inuse_bytes", ms.HeapInuse,
+				"sys_bytes", ms.Sys,
+			)
 		}
 	}
 }
@@ -155,43 +234,34 @@ func (p *Processor) processQueueItems(ctx context.Context) error {
 		return nil // Skip processing when paused
 	}
 
+	// Check if new jobs are auto-blocked due to provider unavailability.
+	// Unlike manual pause, this does NOT affect already-running jobs.
+	p.autoPausedMux.RLock()
+	autoBlocked := p.isAutoBlockingNewJobs
+	p.autoPausedMux.RUnlock()
+
+	if autoBlocked {
+		slog.DebugContext(ctx, "Processor waiting - providers unavailable, blocking new jobs")
+		return nil
+	}
+
 	// Check if we can process next item (e.g., pending config changes)
 	if p.canProcessNextItem != nil && !p.canProcessNextItem() {
 		slog.DebugContext(ctx, "Processor waiting - cannot process new items (callback returned false)")
 		return nil // Skip processing when callback indicates we should wait
 	}
 
-	if p.isRunning {
-		return nil
-	}
-
-	p.isRunning = true
-	defer func() {
-		p.isRunning = false
-	}()
-
-	// Process items with configurable concurrency
-	semaphore := make(chan struct{}, p.cfg.MaxConcurrentUploads)
-	var wg sync.WaitGroup
-
-	// Process multiple items concurrently
-	for range p.cfg.MaxConcurrentUploads {
-		wg.Add(1)
-		semaphore <- struct{}{} // Acquire
-
-		go func() {
-			defer wg.Done()
-			defer func() { <-semaphore }() // Release
-
-			if err := p.processNextItem(ctx); err != nil {
-				if !errors.Is(err, context.Canceled) {
-					slog.ErrorContext(ctx, "Error processing item", "error", err)
-				}
+	// Refill free slots. A slot finishing does not wait for the others, so one
+	// slow item cannot idle the remaining workers; guards above still run once
+	// per dispatch, so pause, auto-block and pending-config draining behave as
+	// before.
+	p.slots.fill(p.cfg.MaxConcurrentUploads, func() {
+		if err := p.processNextItem(ctx); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				slog.ErrorContext(ctx, "Error processing item", "error", err)
 			}
-		}()
-	}
-
-	wg.Wait()
+		}
+	})
 	return nil
 }
 
@@ -214,8 +284,21 @@ func (p *Processor) processNextItem(ctx context.Context) error {
 	}
 
 	if poolManager == nil {
-		slog.WarnContext(ctx, "Pool manager is not available, skipping item processing")
+		slog.WarnContext(ctx, "Pool manager is not available, waiting for server configuration")
 		return nil
+	}
+
+	// Aggregate-size threshold: hold off picking up new jobs until the total
+	// pending bytes meet the configured floor. 0 disables gating (default).
+	if minSize := int64(p.cfg.MinSizeToStart); minSize > 0 {
+		pending, err := p.queue.PendingTotalSize(ctx)
+		if err != nil {
+			slog.WarnContext(ctx, "Failed to read pending queue size, processing anyway", "error", err)
+		} else if pending < minSize {
+			slog.DebugContext(ctx, "Queue below min_size_to_start, holding",
+				"pending", pending, "threshold", minSize)
+			return nil
+		}
 	}
 
 	// Get next item from queue
@@ -232,6 +315,9 @@ func (p *Processor) processNextItem(ctx context.Context) error {
 	// IMMEDIATELY reserve the path to prevent duplicates from watcher
 	// This closes the race condition gap between ReceiveFile() and processFile()
 	p.reservePath(job.Path)
+	// Only a real item wakes the dispatcher; an empty receive must not, or an
+	// idle queue would spin.
+	defer p.slots.signal()
 
 	slog.Info("Processing file", "msg", msg.ID, "path", job.Path, "priority", job.Priority)
 
@@ -280,8 +366,13 @@ func (p *Processor) processNextItem(ctx context.Context) error {
 		}
 
 		// Execute post upload script if configured (NZB is valid)
-		if scriptErr := jobPostie.ExecutePostUploadScript(ctx, actualNzbPath, completedItemID); scriptErr != nil {
+		sourcePath := strings.TrimPrefix(job.Path, "FOLDER:")
+		if scriptErr := jobPostie.ExecutePostUploadScript(ctx, actualNzbPath, sourcePath, completedItemID); scriptErr != nil {
 			slog.ErrorContext(ctx, "Post upload script execution failed", "error", scriptErr, "nzbPath", actualNzbPath)
+		}
+
+		if p.onJobComplete != nil {
+			p.onJobComplete()
 		}
 
 		return nil
@@ -294,6 +385,21 @@ func (p *Processor) processNextItem(ctx context.Context) error {
 		if errors.Is(err, context.Canceled) {
 			slog.Info("Job cancelled", "msg", msg.ID, "path", job.Path)
 
+			// Only clean up if this is a user cancellation (not app shutdown).
+			// If the outer ctx is also done, keep in_progress_items for crash recovery on next start.
+			if ctx.Err() == nil {
+				if cancelErr := p.queue.CancelFile(ctx, msg.ID); cancelErr != nil {
+					slog.ErrorContext(ctx, "Failed to clean up in-progress item after cancel",
+						"error", cancelErr, "id", string(msg.ID))
+				}
+				// The job will not be resumed, so its durable recovery data
+				// (planned rows, manifests) would otherwise be orphaned.
+				if discardErr := p.transferRuntime.DiscardTransfer(ctx, job.TransferID); discardErr != nil {
+					slog.WarnContext(ctx, "Failed to discard transfer after cancel",
+						"error", discardErr, "transfer", job.TransferID)
+				}
+			}
+
 			return nil
 		}
 		// Handle error with retry logic - re-add job to queue
@@ -302,16 +408,52 @@ func (p *Processor) processNextItem(ctx context.Context) error {
 
 	// Use the actual NZB path returned by the postie.Post method
 	// Mark as completed with the NZB path and job data
-	if err := p.queue.CompleteFile(ctx, msg.ID, actualNzbPath, job); err != nil {
+	complete := p.queue.CompleteFile
+	if jobPostie.ReusedSource(job.Path) {
+		complete = p.queue.CompleteReusedFile
+	}
+	if err := complete(ctx, msg.ID, actualNzbPath, job); err != nil {
 		slog.ErrorContext(ctx, "Error marking file as completed", "error", err, "path", job.Path)
 		return err
 	}
 
-	// Execute post upload script if configured
-	// Note: We don't return the error here to avoid failing the completion if the script fails
-	// The script failure will be tracked in the database for retry
-	if scriptErr := jobPostie.ExecutePostUploadScript(ctx, actualNzbPath, string(msg.ID)); scriptErr != nil {
-		slog.ErrorContext(ctx, "Post upload script execution failed", "error", scriptErr, "nzbPath", actualNzbPath)
+	// In durable mode the upload is complete but verification runs in the
+	// background, so the item is pending verification rather than verified.
+	// Link the transfer's files to this completed item so the verification
+	// service can reflect the final verified/failed status back onto it.
+	if p.durableMode() && !jobPostie.ReusedSource(job.Path) {
+		// Link BEFORE flipping the status to pending_verification: a crash
+		// between the two would otherwise strand an item the verification
+		// service can never find (it discovers work through transfer_files).
+		if linkErr := p.transferRuntime.TransferStore().SetCompletedItemForTransfer(ctx, job.TransferID, string(msg.ID)); linkErr != nil {
+			slog.ErrorContext(ctx, "Failed to link completed item to transfer", "error", linkErr, "transfer", job.TransferID)
+		} else if statusErr := p.queue.UpdateCompletedItemVerificationStatus(ctx, string(msg.ID), "pending_verification"); statusErr != nil {
+			slog.ErrorContext(ctx, "Failed to set pending_verification status", "error", statusErr, "path", job.Path)
+		}
+	}
+
+	if jobPostie.ReusedSource(job.Path) {
+		// A retried job can have partial upload records from an earlier attempt.
+		// Reuse supersedes them; none should enter verification or source cleanup.
+		if err := p.transferRuntime.DiscardTransfer(ctx, job.TransferID); err != nil {
+			slog.ErrorContext(ctx, "Failed to discard superseded upload records", "error", err)
+		}
+	}
+
+	// Execute post upload script if configured. In durable mode the script is
+	// deferred until verification succeeds (run by the transfer cleaner), so it
+	// only fires here in standalone mode.
+	// Note: We don't return the error here to avoid failing the completion if the script fails;
+	// the failure is tracked in the database for retry.
+	if !p.durableMode() || jobPostie.ReusedSource(job.Path) {
+		sourcePath := strings.TrimPrefix(job.Path, "FOLDER:")
+		if scriptErr := jobPostie.ExecutePostUploadScript(ctx, actualNzbPath, sourcePath, string(msg.ID)); scriptErr != nil {
+			slog.ErrorContext(ctx, "Post upload script execution failed", "error", scriptErr, "nzbPath", actualNzbPath)
+		}
+	}
+
+	if p.onJobComplete != nil {
+		p.onJobComplete()
 	}
 
 	return nil
@@ -410,24 +552,43 @@ func (p *Processor) processFile(ctx context.Context, msg *goqite.Message, job *q
 		return "", nil, fmt.Errorf("pool manager is not available for job %s", jobID)
 	}
 
-	// Create a postie instance for this job with progress manager
-	jobPostie, err := postie.New(jobCtx, p.config, poolManager, progressJob, p.queue)
+	// Create a postie instance for this job, sharing the process-wide transfer
+	// runtime so PAR2 (and later upload/verification) limits are enforced
+	// globally rather than per queue job.
+	jobPostie, err := postie.NewWithRuntime(jobCtx, p.config, poolManager, progressJob, p.queue, p.transferRuntime, job.TransferID)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create postie instance for job %s: %w", jobID, err)
 	}
 	defer jobPostie.Close()
 
+	// Resolve the delete-original policy (job override wins over the global
+	// setting) and hand it to Postie so it is persisted into the transfer's
+	// cleanup policy at completion. In durable mode the actual deletion happens
+	// only after verification succeeds.
+	deleteOriginal := p.deleteOriginalFile
+	if job.DeleteOriginal != nil {
+		deleteOriginal = *job.DeleteOriginal
+	}
+	jobPostie.SetDeleteOriginal(deleteOriginal)
+
 	// Determine the input folder for maintaining folder structure
 	var inputFolder string
-	if isFolder {
+	switch {
+	case job.InputFolder != "":
+		// Job-supplied root (e.g., HTTP API "relative_path"): use it verbatim
+		// so the NZB output mirrors the directory tree below it.
+		inputFolder = job.InputFolder
+		slog.DebugContext(jobCtx, "Using job-supplied input folder",
+			"inputFolder", inputFolder, "filePath", job.Path)
+	case isFolder:
 		// For folder processing, use the parent directory of the folder
 		inputFolder = filepath.Dir(folderPath)
-	} else if p.watchFolder != "" && isWithinPath(job.Path, p.watchFolder) {
+	case p.watchFolder != "" && isWithinPath(job.Path, p.watchFolder):
 		// For files from the watcher, use the watch folder as root to maintain structure
 		inputFolder = p.watchFolder
 		slog.DebugContext(jobCtx, "Using watch folder as root for folder structure",
 			"watchFolder", p.watchFolder, "filePath", job.Path)
-	} else {
+	default:
 		// For manually added files, use the directory containing the file
 		inputFolder = filepath.Dir(job.Path)
 		slog.DebugContext(jobCtx, "Using file directory as root",
@@ -438,11 +599,39 @@ func (p *Processor) processFile(ctx context.Context, msg *goqite.Message, job *q
 	// Pass isFolder flag to force folder mode (single NZB) for explicit folder uploads
 	actualNzbPath, err := jobPostie.Post(pausableCtx, filesToProcess, inputFolder, p.outputFolder, isFolder)
 	if err != nil {
+		// DeferredCheckError is non-fatal: the NZB was generated and jobPostie is valid.
+		// Return them so the caller can execute the post-upload script and store deferred checks.
+		var deferredErr *poster.DeferredCheckError
+		if errors.As(err, &deferredErr) {
+			return actualNzbPath, jobPostie, err
+		}
 		return "", nil, err
 	}
 
-	// Delete the original files if configured
-	if p.deleteOriginalFile {
+	if jobPostie.ReusedSource(job.Path) {
+		deleteOriginal = false
+	}
+
+	// Delete the original files if configured (deleteOriginal resolved above).
+	// In durable mode, the upload is complete but NOT yet verified. Deleting the
+	// original here would destroy the only recovery source before verification
+	// confirms the articles propagated. Retain originals; deferred cleanup after
+	// successful verification is handled by the durable transfer lifecycle.
+	if deleteOriginal && p.durableMode() {
+		slog.InfoContext(ctx, "Durable mode: retaining original files until verification succeeds",
+			"path", job.Path)
+		deleteOriginal = false
+	}
+	if deleteOriginal {
+		if p.deleteDelay > 0 {
+			slog.InfoContext(ctx, "Waiting before deleting original files", "delay", p.deleteDelay)
+			select {
+			case <-time.After(p.deleteDelay):
+			case <-ctx.Done():
+				slog.WarnContext(ctx, "Context cancelled while waiting to delete files")
+				return actualNzbPath, jobPostie, nil
+			}
+		}
 		for _, fileInfo := range filesToProcess {
 			if err := os.Remove(fileInfo.Path); err != nil {
 				slog.WarnContext(ctx, "Could not delete original file", "path", fileInfo.Path, "error", err)
@@ -455,7 +644,8 @@ func (p *Processor) processFile(ctx context.Context, msg *goqite.Message, job *q
 
 func (p *Processor) handleProcessingError(ctx context.Context, msg *goqite.Message, job *queue.FileJob, jobID string, err error) error {
 	slog.ErrorContext(ctx, "Error processing file",
-		"error", err,
+		"error", err.Error(),
+		"errorType", fmt.Sprintf("%T", err),
 		"path", job.Path,
 		"retryCount", job.RetryCount,
 		"maxRetries", maxRetries,
@@ -480,16 +670,26 @@ func (p *Processor) handleProcessingError(ctx context.Context, msg *goqite.Messa
 
 		if markErr := p.queue.MarkAsError(ctx, msg.ID, job, err.Error()); markErr != nil {
 			slog.ErrorContext(ctx, "Failed to mark job as error", "error", markErr, "path", job.Path)
-			// Re-add to queue as a fallback
+			// Re-add to queue as a fallback. Clear the in_progress row first so the
+			// new goqite entry doesn't appear alongside a stale tracking row.
+			if clearErr := p.queue.ClearInProgress(ctx, msg.ID); clearErr != nil {
+				slog.WarnContext(ctx, "Failed to clear in-progress row before re-add", "error", clearErr, "path", job.Path)
+			}
 			if readdErr := p.queue.ReaddJob(ctx, job); readdErr != nil {
 				slog.ErrorContext(ctx, "Failed to re-add job to queue", "error", readdErr, "path", job.Path)
 			}
 		}
-	} else {
-		// Re-add the job to the queue for retry
-		if readdErr := p.queue.ReaddJob(ctx, job); readdErr != nil {
-			slog.ErrorContext(ctx, "Failed to re-add job to queue for retry", "error", readdErr, "path", job.Path)
-		}
+		return nil
+	}
+
+	// Retry path: clear the in_progress tracking row for the old msg.ID before
+	// re-adding, otherwise the same path is visible as two entries (the new
+	// pending goqite row + the stale in_progress row keyed by the old ID).
+	if clearErr := p.queue.ClearInProgress(ctx, msg.ID); clearErr != nil {
+		slog.WarnContext(ctx, "Failed to clear in-progress row before retry", "error", clearErr, "path", job.Path)
+	}
+	if readdErr := p.queue.ReaddJob(ctx, job); readdErr != nil {
+		slog.ErrorContext(ctx, "Failed to re-add job to queue for retry", "error", readdErr, "path", job.Path)
 	}
 
 	return nil
@@ -575,8 +775,8 @@ func (p *Processor) IsPathBeingProcessed(path string) bool {
 			return true
 		}
 		// Check if path is a file within a reserved folder
-		if strings.HasPrefix(reservedPath, "FOLDER:") {
-			folderPath := strings.TrimPrefix(reservedPath, "FOLDER:")
+		if after, ok := strings.CutPrefix(reservedPath, "FOLDER:"); ok {
+			folderPath := after
 			if isWithinPath(path, folderPath) {
 				p.reservedMux.RUnlock()
 				return true
@@ -594,8 +794,8 @@ func (p *Processor) IsPathBeingProcessed(path string) bool {
 			return true
 		}
 		// Check if path is a file within a folder being processed
-		if strings.HasPrefix(jobDetails.Path, "FOLDER:") {
-			folderPath := strings.TrimPrefix(jobDetails.Path, "FOLDER:")
+		if after, ok := strings.CutPrefix(jobDetails.Path, "FOLDER:"); ok {
+			folderPath := after
 			if isWithinPath(path, folderPath) {
 				return true
 			}
@@ -746,8 +946,46 @@ func (p *Processor) Close() error {
 	p.reservedPaths = make(map[string]time.Time)
 	p.reservedMux.Unlock()
 
+	// Close the transfer runtime after all jobs have stopped. The shared NNTP
+	// pool manager is owned elsewhere and intentionally not closed here.
+	if p.transferRuntime != nil {
+		if err := p.transferRuntime.Close(); err != nil {
+			slog.Warn("Error closing transfer runtime", "error", err)
+		}
+	}
+
 	slog.Info("Processor shutdown completed")
 	return nil
+}
+
+// TransferRuntimeMetrics returns a snapshot of process-wide upload/PAR2
+// resource usage for observability. Returns the zero value when no transfer
+// runtime is configured.
+func (p *Processor) TransferRuntimeMetrics() postie.RuntimeMetrics {
+	return p.transferRuntime.Metrics()
+}
+
+// durableMode reports whether the durable verification path is active, in which
+// case verification (and the destructive cleanup that depends on it) happens in
+// the background service rather than inline at upload completion.
+func (p *Processor) durableMode() bool {
+	return p.transferRuntime.DurableVerificationEnabled()
+}
+
+// DurableMode reports whether the durable verification path is active. Exposed
+// so callers (e.g. the backend) can skip starting the legacy post-check retry
+// worker, which in durable mode would poll a permanently empty
+// pending_article_checks table forever.
+func (p *Processor) DurableMode() bool {
+	return p != nil && p.durableMode()
+}
+
+// setAutoBlock enables or disables blocking of new jobs due to provider unavailability.
+// Unlike PauseProcessing(), this does NOT pause jobs that are already running.
+func (p *Processor) setAutoBlock(blocking bool) {
+	p.autoPausedMux.Lock()
+	defer p.autoPausedMux.Unlock()
+	p.isAutoBlockingNewJobs = blocking
 }
 
 // IsAutoPaused returns true if the processor was automatically paused due to provider unavailability
@@ -802,16 +1040,12 @@ func (p *Processor) checkAndHandleProviderAvailability() {
 		return
 	}
 
-	// Count connected/active providers from map
-	activeProviders := 0
-	totalProviders := len(metrics.ProviderMetrics)
-
-	for _, provider := range metrics.ProviderMetrics {
-		// Consider a provider active if it's in "active" state (string comparison for v2)
-		if provider.State == "active" {
-			activeProviders++
-		}
-	}
+	// Count reachable providers. Error counts are cumulative, so they only carry
+	// health information as a delta against the previous check — see
+	// evaluateProviderAvailability.
+	totalProviders := len(metrics.Providers)
+	activeProviders, nextBaseline := evaluateProviderAvailability(metrics, p.providerErrorBaseline)
+	p.providerErrorBaseline = nextBaseline
 
 	p.autoPausedMux.Lock()
 	wasAutoPaused := p.isAutoPaused
@@ -822,10 +1056,15 @@ func (p *Processor) checkAndHandleProviderAvailability() {
 		"totalProviders", totalProviders,
 		"wasAutoPaused", wasAutoPaused)
 
-	// If no providers are available and we haven't auto-paused yet
+	// If no providers are available and we haven't auto-paused yet.
+	// Use setAutoBlock instead of PauseProcessing so that already-running jobs
+	// are not paused — they must be allowed to continue (and reconnect) so that
+	// ActiveConnections eventually becomes > 0 and auto-resume can trigger.
+	// Pausing running jobs creates a deadlock: paused jobs make no connections,
+	// errors never clear, auto-resume never fires.
 	if activeProviders == 0 && totalProviders > 0 && !wasAutoPaused {
-		slog.Warn("No providers available - auto-pausing processing")
-		p.PauseProcessing()
+		slog.Warn("No providers available - blocking new jobs (running jobs continue unaffected)")
+		p.setAutoBlock(true)
 
 		p.autoPausedMux.Lock()
 		p.isAutoPaused = true
@@ -833,15 +1072,17 @@ func (p *Processor) checkAndHandleProviderAvailability() {
 		p.autoPausedMux.Unlock()
 	}
 
-	// If providers are available and we were auto-paused
+	// If providers are available and we were auto-paused, unblock new jobs.
+	// Do not touch the manual pause state — if the user manually paused,
+	// that remains in effect.
 	if activeProviders > 0 && wasAutoPaused {
-		// Only resume if the processor was paused by us (auto-pause)
-		// Check if it's still paused - if user manually resumed, don't override
-		if p.IsPaused() {
-			slog.Info("Providers available - auto-resuming processing",
-				"activeProviders", activeProviders)
-			p.ResumeProcessing()
-		}
+		// This also fires as a probe: with no jobs running, no new errors can
+		// accrue, so a still-dead provider looks reachable until the next job
+		// actually tries it. That retry is the point — never unblocking is the
+		// failure mode this replaced.
+		slog.Info("No new provider errors since last check - allowing new jobs",
+			"activeProviders", activeProviders)
+		p.setAutoBlock(false)
 
 		p.autoPausedMux.Lock()
 		p.isAutoPaused = false

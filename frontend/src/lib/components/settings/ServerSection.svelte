@@ -1,14 +1,10 @@
 <script lang="ts">
-import apiClient from "$lib/api/client";
 import NntpServerManager from "$lib/components/NntpServerManager.svelte";
 import { t } from "$lib/i18n";
 import { advancedMode } from "$lib/stores/app";
-import { toastStore } from "$lib/stores/toast";
 import { config as configType } from "$lib/wailsjs/go/models";
-import {
-	Save,
-	Server,
-} from "lucide-svelte";
+import { AlertTriangle } from "lucide-svelte";
+import { collapse } from "./collapse";
 
 interface Props {
 	config: configType.ConfigData;
@@ -16,132 +12,143 @@ interface Props {
 
 let { config = $bindable() }: Props = $props();
 
-let saving = $state(false);
 let isAdvanced = $derived($advancedMode);
 
-// Convert config servers to the format expected by NntpServerManager
-let managedServers = $derived(config.servers.map(server => ({
-	enabled: server.enabled ?? true,
-	host: server.host || "",
-	port: server.port || 119,
-	username: server.username || "",
-	password: server.password || "",
-	max_connections: server.max_connections || 10,
-	ssl: server.ssl ?? false,
-	insecure_ssl: server.insecure_ssl ?? false,
-	max_connection_idle_time_in_seconds: server.max_connection_idle_time_in_seconds || 300,
-	max_connection_ttl_in_seconds: server.max_connection_ttl_in_seconds || 3600,
-	check_only: server.check_only ?? false,
-})));
-
-function handleServerUpdate(updatedServers: any[]) {
-	// Convert from our generic server format to config.ServerConfig
-	config.servers = updatedServers.map(server => {
-		const serverConfig = new configType.ServerConfig();
-		serverConfig.enabled = server.enabled ?? true;
-		serverConfig.host = server.host || "";
-		serverConfig.port = server.port || 119;
-		serverConfig.username = server.username || "";
-		serverConfig.password = server.password || "";
-		serverConfig.max_connections = server.max_connections || 10;
-		serverConfig.ssl = server.ssl ?? false;
-		serverConfig.insecure_ssl = server.insecure_ssl ?? false;
-		serverConfig.max_connection_idle_time_in_seconds = server.max_connection_idle_time_in_seconds || 300;
-		serverConfig.max_connection_ttl_in_seconds = server.max_connection_ttl_in_seconds || 3600;
-		serverConfig.check_only = server.check_only ?? false;
-		return serverConfig;
-	});
-}
-
-
-async function saveServerSettings() {
-	try {
-		saving = true;
-
-		// Validate that all servers have required fields
-		for (let i = 0; i < config.servers.length; i++) {
-			const server = config.servers[i];
-			if (!server.host || server.host.trim() === "") {
-				toastStore.error(
-					"Configuration Error",
-					$t("settings.server.validation_errors.host_required", {
-							values: { number: i + 1 },
-					}),
-				);
-				return;
-			}
-			if (!server.port || server.port <= 0 || server.port > 65535) {
-				toastStore.error(
-					"Configuration Error",
-					$t("settings.server.validation_errors.port_invalid", {
-							values: { number: i + 1 },
-					}),
-				);
-				return;
-			}
-		}
-
-		// Get the current config from the server to avoid conflicts
-		const currentConfig = await apiClient.getConfig();
-
-		// Only update the server fields with proper type conversion
-		currentConfig.servers = config.servers.map(
-			(server: configType.ServerConfig) => ({
-				...server,
-				port: server.port || 119,
-				max_connections: server.max_connections || 10,
-				max_connection_idle_time_in_seconds:
-					server.max_connection_idle_time_in_seconds || 300,
-				max_connection_ttl_in_seconds:
-					server.max_connection_ttl_in_seconds || 3600,
-			}),
+let hasMultipleUploadBackbones = $derived(
+	(() => {
+		const hosts = new Set(
+			(config.servers ?? [])
+				.filter(s => s != null && (s.role || "upload") !== "verify" && s.enabled !== false)
+				.map(s => s.host)
+				.filter(h => h)
 		);
+		return hosts.size > 1;
+	})()
+);
 
-		console.log("Saving server settings:", currentConfig);
-
-		await apiClient.saveConfig(currentConfig);
-	} catch (error) {
-		console.error("Failed to save server settings:", error);
-		toastStore.error($t("common.messages.error_saving"), String(error));
-	} finally {
-		saving = false;
-	}
+// Helper to build a ServerConfig from a plain object
+function toServerConfig(server: any, role: "upload" | "verify"): configType.ServerConfig {
+	const s = new configType.ServerConfig();
+	s.name = server.name || "";
+	s.enabled = server.enabled ?? true;
+	s.host = server.host || "";
+	s.port = server.port || 119;
+	s.username = server.username || "";
+	s.password = server.password || "";
+	s.max_connections = server.max_connections || 10;
+	s.inflight = server.inflight || 10;
+	s.ssl = server.ssl ?? false;
+	s.insecure_ssl = server.insecure_ssl ?? false;
+	s.max_connection_idle_time_in_seconds = server.max_connection_idle_time_in_seconds || 300;
+	s.max_connection_ttl_in_seconds = server.max_connection_ttl_in_seconds || 3600;
+	s.role = role;
+	s.proxy_url = server.proxy_url || "";
+	return s;
 }
+
+// Derive filtered lists to pass to each NntpServerManager
+let uploadManagedServers = $derived(
+	(config.servers ?? [])
+		.filter(s => s != null && (s.role || "upload") !== "verify")
+		.map(s => ({
+			name: s.name || "",
+			enabled: s.enabled ?? true,
+			host: s.host || "",
+			port: s.port || 119,
+			username: s.username || "",
+			password: s.password || "",
+			max_connections: s.max_connections || 10,
+			ssl: s.ssl ?? false,
+			insecure_ssl: s.insecure_ssl ?? false,
+			max_connection_idle_time_in_seconds: s.max_connection_idle_time_in_seconds || 300,
+			max_connection_ttl_in_seconds: s.max_connection_ttl_in_seconds || 3600,
+			role: "upload" as const,
+			inflight: s.inflight || 10,
+			proxy_url: s.proxy_url || "",
+		}))
+);
+
+let verifyManagedServers = $derived(
+	(config.servers ?? [])
+		.filter(s => s != null && s.role === "verify")
+		.map(s => ({
+			name: s.name || "",
+			enabled: s.enabled ?? true,
+			host: s.host || "",
+			port: s.port || 119,
+			username: s.username || "",
+			password: s.password || "",
+			max_connections: s.max_connections || 10,
+			ssl: s.ssl ?? false,
+			insecure_ssl: s.insecure_ssl ?? false,
+			max_connection_idle_time_in_seconds: s.max_connection_idle_time_in_seconds || 300,
+			max_connection_ttl_in_seconds: s.max_connection_ttl_in_seconds || 3600,
+			role: "verify" as const,
+			inflight: s.inflight || 10,
+			proxy_url: s.proxy_url || "",
+		}))
+);
+
+function handleUploadUpdate(updatedServers: any[]) {
+	config.servers = [
+		...updatedServers.map(s => toServerConfig(s, "upload")),
+		...(config.servers ?? []).filter(s => s?.role === "verify").map(s => toServerConfig(s, "verify")),
+	];
+}
+
+function handleVerifyUpdate(updatedServers: any[]) {
+	config.servers = [
+		...(config.servers ?? []).filter(s => s != null && (s.role || "upload") !== "verify").map(s => toServerConfig(s, "upload")),
+		...updatedServers.map(s => toServerConfig(s, "verify")),
+	];
+}
+
 </script>
 
-<div class="card bg-base-100 shadow-sm">
-  <div class="card-body space-y-6">
-    <div class="flex items-center justify-between">
-      <div class="flex items-center gap-3">
-        <Server class="w-5 h-5 text-blue-600 dark:text-blue-400" />
-        <h2 class="text-lg font-semibold text-base-content">
-          {$t('settings.server.title')}
-        </h2>
+<div class="space-y-6">
+  <!-- Upload Pool -->
+  <section>
+    <div class="section-label">{$t("settings.server.upload_pool_title")}</div>
+    <p class="settings-row-desc mx-1 mb-2">{$t("settings.server.upload_pool_description")}</p>
+
+    {#if hasMultipleUploadBackbones}
+      <div transition:collapse role="status">
+        <div class="mb-3 flex items-start gap-3 rounded-(--radius-box) border border-warning/40 bg-warning/10 px-4 py-3">
+          <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0 text-warning-ink" />
+          <span class="text-sm">{$t("settings.server.multiple_backbones_warning")}</span>
+        </div>
       </div>
-    </div>
+    {/if}
 
     <NntpServerManager
-      servers={managedServers}
-      onupdate={handleServerUpdate}
+      servers={uploadManagedServers}
+      onupdate={handleUploadUpdate}
       showAdvancedFields={isAdvanced}
       variant="settings"
+      restrictedRole="upload"
     />
+  </section>
 
-    <!-- Save Button -->
-    <div class="pt-4 border-t border-base-300">
-      <button
-        type="button"
-        class="btn btn-success mb-4"
-        onclick={saveServerSettings}
-        disabled={saving}
-      >
-        <Save class="w-4 h-4" />
-        {saving ? $t('common.common.saving') : $t('settings.server.save_button')}
-      </button>
-      
-      <p class="text-sm text-base-content/70">
-        {@html $t('settings.server.tip')}
-      </p>
+  <!-- Verify Pool -->
+  <section>
+    <div class="section-label">
+      {$t("settings.server.verify_pool_title")}
+      <span class="badge badge-ghost badge-sm ml-1 normal-case tracking-normal">
+        {$t("settings.server.verify_pool_optional")}
+      </span>
     </div>
-  </div>
+    <p class="settings-row-desc mx-1 mb-2">{$t("settings.server.verify_pool_description")}</p>
+
+    <NntpServerManager
+      servers={verifyManagedServers}
+      onupdate={handleVerifyUpdate}
+      showAdvancedFields={isAdvanced}
+      variant="settings"
+      restrictedRole="verify"
+    />
+  </section>
+
+  <p class="settings-row-desc mx-1">
+    {@html $t("settings.server.tip")}
+  </p>
 </div>

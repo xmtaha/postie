@@ -1,99 +1,95 @@
 import { browser } from "$app/environment";
-import { writable } from "svelte/store";
+import { readable, writable } from "svelte/store";
 
-// Available DaisyUI themes
-export const availableThemes = [
-	{ name: "Light", value: "cupcake", category: "Light" },
-	{ name: "Bumblebee", value: "bumblebee", category: "Light" },
-	{ name: "Emerald", value: "emerald", category: "Light" },
-	{ name: "Dracula", value: "dracula", category: "Dark" },
-	{ name: "Corporate", value: "corporate", category: "Light" },
-	{ name: "Dark", value: "dim", category: "Light" },
-] as const;
+/** User-facing appearance choice. */
+export type Appearance = "system" | "light" | "dark";
+/** Resolved colour scheme actually applied. */
+export type ResolvedScheme = "light" | "dark";
 
-export type ThemeValue = (typeof availableThemes)[number]["value"];
+export const APPEARANCES: readonly Appearance[] = ["system", "light", "dark"];
+export const THEME_STORAGE_KEY = "theme";
+const THEME_NAMES: Record<ResolvedScheme, string> = {
+	light: "postie-light",
+	dark: "postie-dark",
+};
 
-// Default theme
-const defaultTheme: ThemeValue = "cupcake";
-
-// Get initial theme from localStorage or system preference
-function getInitialTheme(): ThemeValue {
-	if (!browser) return defaultTheme;
-
-	const saved = localStorage.getItem("theme") as ThemeValue;
-	if (saved && availableThemes.some((t) => t.value === saved)) {
-		return saved;
-	}
-
-	// Check system preference
-	const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-	return prefersDark ? "dim" : "cupcake";
+function isAppearance(value: unknown): value is Appearance {
+	return value === "system" || value === "light" || value === "dark";
 }
 
-// Create the theme store
-function createThemeStore() {
-	const { subscribe, set } = writable<ThemeValue>(getInitialTheme());
+function readStored(): Appearance {
+	if (!browser) return "system";
+	try {
+		const saved = localStorage.getItem(THEME_STORAGE_KEY);
+		if (isAppearance(saved)) return saved;
+		// Legacy daisyUI theme name (cupcake, dracula, ...) migrates to System.
+		if (saved !== null) localStorage.setItem(THEME_STORAGE_KEY, "system");
+	} catch {
+		// storage unavailable
+	}
+	return "system";
+}
+
+function systemScheme(): ResolvedScheme {
+	if (!browser) return "light";
+	return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function resolve(appearance: Appearance): ResolvedScheme {
+	return appearance === "system" ? systemScheme() : appearance;
+}
+
+function applyScheme(scheme: ResolvedScheme) {
+	if (!browser) return;
+	document.documentElement.setAttribute("data-theme", THEME_NAMES[scheme]);
+}
+
+function createAppearanceStore() {
+	const appearance = writable<Appearance>(readStored());
+	const resolved = writable<ResolvedScheme>(resolve(readStored()));
+	let current: Appearance = readStored();
+	let transitionTimer: number | undefined;
+
+	if (browser) {
+		applyScheme(resolve(current));
+		window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+			if (current !== "system") return;
+			const scheme = systemScheme();
+			applyScheme(scheme);
+			resolved.set(scheme);
+		});
+	}
+
+	function set(next: Appearance) {
+		if (!isAppearance(next)) return;
+		current = next;
+		appearance.set(next);
+		if (!browser) return;
+		try {
+			localStorage.setItem(THEME_STORAGE_KEY, next);
+		} catch {
+			// storage unavailable
+		}
+		const scheme = resolve(next);
+		const root = document.documentElement;
+		root.classList.add("theme-transition");
+		applyScheme(scheme);
+		resolved.set(scheme);
+		if (transitionTimer !== undefined) window.clearTimeout(transitionTimer);
+		const base = Number.parseFloat(getComputedStyle(root).getPropertyValue("--motion-base")) || 200;
+		transitionTimer = window.setTimeout(() => {
+			root.classList.remove("theme-transition");
+			transitionTimer = undefined;
+		}, base + 50);
+	}
 
 	return {
-		subscribe,
-		set: (theme: ThemeValue) => {
-			if (browser) {
-				// Apply theme to document
-				document.documentElement.setAttribute("data-theme", theme);
-
-				// Save to localStorage
-				localStorage.setItem("theme", theme);
-			}
-			set(theme);
-		},
-		setTheme: (theme: ThemeValue) => {
-			if (availableThemes.some((t) => t.value === theme)) {
-				if (browser) {
-					// Add transition class for smooth theme switching
-					document.documentElement.classList.add("theme-transition");
-					document.documentElement.setAttribute("data-theme", theme);
-					localStorage.setItem("theme", theme);
-					// Remove transition class after animation completes
-					setTimeout(() => {
-						document.documentElement.classList.remove("theme-transition");
-					}, 250);
-				}
-				set(theme);
-			}
-		},
-		reset: () => {
-			if (browser) {
-				localStorage.removeItem("theme");
-				document.documentElement.setAttribute("data-theme", defaultTheme);
-			}
-			set(defaultTheme);
-		},
+		/** Current choice: "system" | "light" | "dark". */
+		subscribe: appearance.subscribe,
+		set,
+		/** Resolved light/dark scheme currently applied. */
+		resolved: readable<ResolvedScheme>("light", (setValue) => resolved.subscribe(setValue)),
 	};
 }
 
-export const currentTheme = createThemeStore();
-
-// Group themes by category
-export const groupedThemes = availableThemes.reduce(
-	(acc, theme) => {
-		if (!acc[theme.category]) {
-			acc[theme.category] = [];
-		}
-		acc[theme.category].push(theme);
-		return acc;
-	},
-	{} as Record<string, (typeof availableThemes)[number][]>,
-);
-
-// Helper to get theme info
-export function getThemeInfo(themeValue: ThemeValue) {
-	return (
-		availableThemes.find((t) => t.value === themeValue) || availableThemes[0]
-	);
-}
-
-// Initialize theme on first load
-if (browser) {
-	const initialTheme = getInitialTheme();
-	document.documentElement.setAttribute("data-theme", initialTheme);
-}
+export const appearance = createAppearanceStore();

@@ -1,12 +1,31 @@
 {
 	"common": {
+		"auth": {
+			"retry": "Retry",
+			"signIn": "Sign in to Postie",
+			"createAdmin": "Create administrator account",
+			"signOut": "Sign out",
+			"username": "Username or email",
+			"email": "Email (optional)",
+			"password": "Password",
+			"bootstrapDescription": "Create the first administrator account. Registration closes after this account is created.",
+			"passwordHint": "Use a password of 12–72 bytes.",
+			"invalidCredentials": "Invalid username or password.",
+			"registrationError": "Unable to register. Check your details or sign in if an account already exists.",
+			"connectionError": "Cannot connect to the server. Please reload to retry.",
+			"tooManyAttempts": "Too many attempts. Wait one minute and try again.",
+			"logoutError": "Unable to sign out."
+		},
 		"nav": {
 			"dashboard": "Dashboard",
 			"settings": "Settings",
 			"metrics": "Metrics",
 			"logs": "Logs",
 			"language": "Language",
-			"theme": "Theme"
+			"theme": "Theme",
+			"menu": "Open menu",
+			"closeMenu": "Close menu",
+			"primary": "Main navigation"
 		},
 		"actions": {
 			"save": "Save",
@@ -87,7 +106,18 @@
 			"item_cancelled": "Item cancelled",
 			"failed_to_cancel_item": "Failed to cancel item"
 		},
-		"app_name": "Postie"
+		"app_name": "Postie",
+		"appearance": {
+			"label": "Appearance",
+			"system": "System",
+			"light": "Light",
+			"dark": "Dark"
+		},
+		"connection": {
+			"connected": "Connected",
+			"reconnecting": "Reconnecting…",
+			"disconnected": "Disconnected"
+		}
 	},
 	"logs": {
 		"download": "Download",

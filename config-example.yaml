@@ -1,6 +1,7 @@
 # Example configuration for nzb-upload with queue settings
 servers:
-  - host: 'news.example.com'
+  - name: 'Primary Provider' # optional display name shown in the UI instead of "Provider 1"
+    host: 'news.example.com'
     port: 563
     username: 'your_username'
     password: 'your_password'
@@ -22,6 +23,10 @@ posting:
     - name: 'alt.binaries.test'
       enabled: true
   throttle_rate: 0
+  # Total memory the process-wide upload engine may reserve for in-flight
+  # article buffers, independent of queue.max_concurrent_uploads.
+  # 0 = auto (sized from connection capacity and article size, 64 MiB-512 MiB).
+  upload_buffer_memory_limit: 0
   message_id_format: 'random'
   obfuscation_policy: 'full'
   par2_obfuscation_policy: 'full'
@@ -35,14 +40,21 @@ post_check:
   enabled: true
   delay: 10s
   max_reposts: 1
+  # Max concurrent STAT verification checks across the whole process.
+  # 0 = auto (dedicated verify pool capped at 16, shared upload pool capped at 2).
+  max_concurrent_checks: 0
 
 par2:
   enabled: true
   redundancy: '10%'
-  # Directory where PAR2 files are temporarily created (uses system temp by default)
+  # Directory where PAR2 files are temporarily created (uses system temp by default).
+  # Postie writes into a postie-par2/ subfolder there and sweeps orphaned sets older than 24h.
   temp_dir: ''
   # Whether to keep PAR2 files after successful upload (false = cleanup after success)
   maintain_par2_files: false
+  # Max concurrent PAR2 operations across the whole process. memory_limit applies
+  # per active job, so keep this low (default 1) to bound total PAR2 memory.
+  max_concurrent_jobs: 1
 
 watcher:
   enabled: false
@@ -99,3 +111,12 @@ post_upload_script:
 #   enabled: true
 #   command: 'curl -X POST -H "Content-Type: application/json" -d "{\"nzb_path\": \"{nzb_path}\"}" https://your-webhook-url.com/notify'
 #   timeout: 30s
+
+# Optional pre-upload lookup for individual files. Folder uploads bypass lookup.
+# A match retains the source, including when automatic source deletion is enabled.
+# See docs/duplicate-lookup.md for the generic HTTP protocol.
+duplicate_lookup:
+  enabled: false
+  url: ""
+  api_key: ""
+  timeout: 60s

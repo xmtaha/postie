@@ -12,7 +12,7 @@ package mocks
 import (
 	reflect "reflect"
 
-	article "github.com/javi11/postie/internal/article"
+	article "github.com/kipsilabs/postie/internal/article"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -77,4 +77,16 @@ func (m *MockNZBGenerator) Generate(outputPath string) (string, error) {
 func (mr *MockNZBGeneratorMockRecorder) Generate(outputPath any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Generate", reflect.TypeOf((*MockNZBGenerator)(nil).Generate), outputPath)
+}
+
+// RemoveFile mocks base method.
+func (m *MockNZBGenerator) RemoveFile(filename string) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "RemoveFile", filename)
+}
+
+// RemoveFile indicates an expected call of RemoveFile.
+func (mr *MockNZBGeneratorMockRecorder) RemoveFile(filename any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RemoveFile", reflect.TypeOf((*MockNZBGenerator)(nil).RemoveFile), filename)
 }

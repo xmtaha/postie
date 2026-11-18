@@ -9,26 +9,38 @@ import (
 	"strings"
 	"time"
 
-	"github.com/javi11/postie/internal/config"
-	"github.com/javi11/postie/internal/pool"
+	"github.com/kipsilabs/postie/internal/config"
+	"github.com/kipsilabs/postie/internal/pool"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // GetConfigPath returns the path to the configuration file
 func (a *App) GetConfigPath() string {
+	a.configFileMux.RLock()
+	defer a.configFileMux.RUnlock()
 	return a.configPath
 }
 
 // GetConfig returns the current configuration (pending config if available, otherwise applied config)
-func (a *App) GetConfig() (*config.ConfigData, error) {
+func (a *App) GetConfig() (result *config.ConfigData, resultErr error) {
+	defer func() {
+		if result != nil && resultErr == nil {
+			a.configFileMux.Lock()
+			a.configLoadError = ""
+			a.configFileMux.Unlock()
+		}
+	}()
 	defer a.recoverPanic("GetConfig")
+	if a.configLocationErr != nil {
+		return nil, a.configLocationErr
+	}
 
-	if a.configPath == "" {
+	if a.GetConfigPath() == "" {
 		return nil, fmt.Errorf("no config file specified")
 	}
 
 	// Check if file exists
-	if _, err := os.Stat(a.configPath); os.IsNotExist(err) {
+	if _, err := os.Stat(a.GetConfigPath()); os.IsNotExist(err) {
 		return nil, fmt.Errorf("config file not found")
 	}
 
@@ -48,7 +60,7 @@ func (a *App) GetConfig() (*config.ConfigData, error) {
 	}
 
 	// Otherwise load it fresh
-	cfg, err := config.Load(a.configPath)
+	cfg, err := config.Load(a.GetConfigPath())
 	if err != nil {
 		return nil, fmt.Errorf("error loading config file: %w", err)
 	}
@@ -60,12 +72,12 @@ func (a *App) GetConfig() (*config.ConfigData, error) {
 func (a *App) GetAppliedConfig() (*config.ConfigData, error) {
 	defer a.recoverPanic("GetAppliedConfig")
 
-	if a.configPath == "" {
+	if a.GetConfigPath() == "" {
 		return nil, fmt.Errorf("no config file specified")
 	}
 
 	// Check if file exists
-	if _, err := os.Stat(a.configPath); os.IsNotExist(err) {
+	if _, err := os.Stat(a.GetConfigPath()); os.IsNotExist(err) {
 		return nil, fmt.Errorf("config file not found")
 	}
 
@@ -75,7 +87,7 @@ func (a *App) GetAppliedConfig() (*config.ConfigData, error) {
 	}
 
 	// Otherwise load it fresh
-	cfg, err := config.Load(a.configPath)
+	cfg, err := config.Load(a.GetConfigPath())
 	if err != nil {
 		return nil, fmt.Errorf("error loading config file: %w", err)
 	}
@@ -87,7 +99,12 @@ func (a *App) GetAppliedConfig() (*config.ConfigData, error) {
 func (a *App) SaveConfig(configData *config.ConfigData) error {
 	defer a.recoverPanic("SaveConfig")
 
-	slog.Info("Saving config", "path", a.configPath, "configData", configData)
+	slog.Info("Saving config", "path", a.GetConfigPath(), "configData", configData)
+
+	// Validate structure before anything else (prevents writing bad config to disk)
+	if err := configData.Validate(); err != nil {
+		return err
+	}
 
 	// Ensure version is set to current version when saving
 	configData.Version = config.CurrentConfigVersion
@@ -111,12 +128,12 @@ func (a *App) SaveConfig(configData *config.ConfigData) error {
 		a.pendingConfigMux.Unlock()
 
 		// Save to file but don't apply yet
-		if err := config.SaveConfig(configData, a.configPath); err != nil {
+		if err := a.saveConfigFile(configData); err != nil {
 			return err
 		}
 
 		// Emit pending config event to frontend
-		pendingStatus := map[string]interface{}{
+		pendingStatus := map[string]any{
 			"hasPendingConfig": true,
 			"message":          "Configuration changes will be applied when current uploads finish",
 		}
@@ -134,105 +151,235 @@ func (a *App) SaveConfig(configData *config.ConfigData) error {
 	return a.applyConfigChanges(configData)
 }
 
-// poolConfigChanged checks if pool-related configuration has changed
+// poolConfigChanged checks whether the provider list has changed in a way that
+// requires touching the NNTP pool. Only provider-affecting fields are
+// considered — non-provider settings (Posting, Watcher, Queue, etc.) must not
+// trigger pool updates.
+//
+// Note: ConnectionPool.MinConnections and ConnectionPool.HealthCheckInterval
+// are deliberately excluded. They are nntppool.NewClient construction options
+// and cannot be applied to a running client by AddProvider/RemoveProvider, so
+// changing them requires an application restart to take effect.
+//
+// Server reordering with no other changes is treated as no change (providers
+// are matched by their canonical key, not by index).
 func (a *App) poolConfigChanged(newConfig *config.ConfigData) bool {
 	if a.config == nil {
 		return true // No existing config, so pool needs to be created
 	}
 
-	oldConfig := a.config
+	oldByKey := make(map[string]config.ServerConfig, len(a.config.Servers))
+	for _, s := range a.config.Servers {
+		oldByKey[pool.ProviderKey(s)] = s
+	}
 
-	// Compare servers
-	if len(oldConfig.Servers) != len(newConfig.Servers) {
+	if len(newConfig.Servers) != len(oldByKey) {
 		return true
 	}
 
-	for i, newServer := range newConfig.Servers {
-		oldServer := oldConfig.Servers[i]
-		if newServer.Host != oldServer.Host ||
-			newServer.Port != oldServer.Port ||
-			newServer.Username != oldServer.Username ||
-			newServer.Password != oldServer.Password ||
-			newServer.SSL != oldServer.SSL ||
-			newServer.MaxConnections != oldServer.MaxConnections ||
-			newServer.MaxConnectionIdleTimeInSeconds != oldServer.MaxConnectionIdleTimeInSeconds ||
-			newServer.MaxConnectionTTLInSeconds != oldServer.MaxConnectionTTLInSeconds ||
-			newServer.InsecureSSL != oldServer.InsecureSSL ||
-			((newServer.Enabled == nil) != (oldServer.Enabled == nil)) ||
-			(newServer.Enabled != nil && oldServer.Enabled != nil && *newServer.Enabled != *oldServer.Enabled) {
+	for _, newSrv := range newConfig.Servers {
+		oldSrv, ok := oldByKey[pool.ProviderKey(newSrv)]
+		if !ok {
+			return true
+		}
+		if pool.ServerConfigChanged(oldSrv, newSrv) {
 			return true
 		}
 	}
 
-	// Compare connection pool settings
-	if oldConfig.ConnectionPool.MinConnections != newConfig.ConnectionPool.MinConnections ||
-		oldConfig.ConnectionPool.HealthCheckInterval != newConfig.ConnectionPool.HealthCheckInterval {
+	return false
+}
+
+// processorConfigChanged checks if config fields captured at processor init time have changed.
+// The processor holds a.poolManager by pointer so pool-only changes don't require a restart.
+func (a *App) processorConfigChanged(newConfig *config.ConfigData) bool {
+	if a.config == nil {
+		return true
+	}
+	old := a.config
+	if old.GetDuplicateLookupConfig() != newConfig.GetDuplicateLookupConfig() {
 		return true
 	}
 
-	// Compare posting settings that affect the pool
-	if oldConfig.Posting.MaxRetries != newConfig.Posting.MaxRetries ||
-		oldConfig.Posting.RetryDelay != newConfig.Posting.RetryDelay {
+	if old.GetOutputDir() != newConfig.GetOutputDir() {
+		return true
+	}
+	if old.GetMaintainOriginalExtension() != newConfig.GetMaintainOriginalExtension() {
+		return true
+	}
+	if old.GetQueueConfig() != newConfig.GetQueueConfig() {
+		return true
+	}
+
+	// Watcher fields captured by processor at init time
+	oldW := old.GetWatcherConfig()
+	newW := newConfig.GetWatcherConfig()
+	if oldW.DeleteOriginalFile != newW.DeleteOriginalFile ||
+		oldW.MinFileAgeToDelete != newW.MinFileAgeToDelete ||
+		oldW.WatchDirectory != newW.WatchDirectory ||
+		oldW.FollowSymlinks != newW.FollowSymlinks {
+		return true
+	}
+
+	if a.par2ConfigChanged(newConfig) {
 		return true
 	}
 
 	return false
 }
 
+func equalBoolPtr(a, b *bool) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// par2ConfigChanged reports whether any Par2Config field has changed. Par2
+// settings are captured by Postie when each job starts, so flipping any of
+// them (in particular ParparBinaryPath, which selects the native vs. external
+// par2 executor) requires reinitializing the processor.
+func (a *App) par2ConfigChanged(newConfig *config.ConfigData) bool {
+	if a.config == nil {
+		return true
+	}
+	oldP := a.config.Par2
+	newP := newConfig.Par2
+
+	if !equalBoolPtr(oldP.Enabled, newP.Enabled) ||
+		!equalBoolPtr(oldP.MaintainPar2Files, newP.MaintainPar2Files) ||
+		!equalBoolPtr(oldP.SkipIfPar2Exists, newP.SkipIfPar2Exists) {
+		return true
+	}
+	if oldP.Redundancy != newP.Redundancy ||
+		oldP.TempDir != newP.TempDir ||
+		oldP.ParparBinaryPath != newP.ParparBinaryPath ||
+		oldP.NumGoroutines != newP.NumGoroutines ||
+		oldP.MemoryLimit != newP.MemoryLimit ||
+		oldP.SliceSize != newP.SliceSize {
+		return true
+	}
+	if len(oldP.ParparExtraArgs) != len(newP.ParparExtraArgs) {
+		return true
+	}
+	for i := range newP.ParparExtraArgs {
+		if oldP.ParparExtraArgs[i] != newP.ParparExtraArgs[i] {
+			return true
+		}
+	}
+	return false
+}
+
+// watcherConfigChanged checks if any watcher configuration has changed.
+func (a *App) watcherConfigChanged(newConfig *config.ConfigData) bool {
+	if a.config == nil {
+		return true
+	}
+	oldCfgs := a.config.GetWatcherConfigs()
+	newCfgs := newConfig.GetWatcherConfigs()
+	if len(oldCfgs) != len(newCfgs) {
+		return true
+	}
+	for i := range newCfgs {
+		o, n := oldCfgs[i], newCfgs[i]
+		if o.Name != n.Name ||
+			o.Enabled != n.Enabled ||
+			o.WatchDirectory != n.WatchDirectory ||
+			o.SizeThreshold != n.SizeThreshold ||
+			o.Schedule != n.Schedule ||
+			o.MinFileSize != n.MinFileSize ||
+			o.CheckInterval != n.CheckInterval ||
+			o.DeleteOriginalFile != n.DeleteOriginalFile ||
+			o.SingleNzbPerFolder != n.SingleNzbPerFolder ||
+			o.FollowSymlinks != n.FollowSymlinks ||
+			o.MinFileAge != n.MinFileAge ||
+			o.MinFileAgeToDelete != n.MinFileAgeToDelete {
+			return true
+		}
+		if len(o.IgnorePatterns) != len(n.IgnorePatterns) {
+			return true
+		}
+		for j := range n.IgnorePatterns {
+			if o.IgnorePatterns[j] != n.IgnorePatterns[j] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // applyConfigChanges applies the configuration changes immediately
 func (a *App) applyConfigChanges(configData *config.ConfigData) error {
-	if err := config.SaveConfig(configData, a.configPath); err != nil {
+	if err := a.saveConfigFile(configData); err != nil {
 		return err
 	}
 
+	// Capture change flags before reloading config (a.config = old, configData = new)
 	poolCfgChanged := a.poolConfigChanged(configData)
+	procNeedsRestart := a.processorConfigChanged(configData)
+	watchNeedsRestart := a.watcherConfigChanged(configData)
 
 	// Reload configuration
 	if err := a.loadConfig(); err != nil {
 		return err
 	}
 
-	if err := a.initializeProcessor(); err != nil {
-		slog.Error("Failed to re-initialize processor after config change", "error", err)
+	// Clear any pending config before reinitializing components so that the new
+	// processor starts with an unblocked canProcessNextItem callback.
+	a.pendingConfigMux.Lock()
+	a.pendingConfig = nil
+	a.pendingConfigMux.Unlock()
+
+	// Initialize queue if not yet created (e.g. after setup wizard on first start)
+	if a.queue == nil {
+		if err := a.initializeQueue(); err != nil {
+			slog.Error("Failed to initialize queue after config change", "error", err)
+		}
 	}
 
-	// Always check watcher configuration
-	if err := a.initializeWatcher(); err != nil {
-		slog.Error("Failed to re-initialize watcher after config change", "error", err)
-	}
-
-	// Update or create the connection pool manager
-	if a.poolManager != nil && poolCfgChanged {
+	// Update or create the connection pool manager. The pool is only touched
+	// when the provider list actually changed (poolCfgChanged), or when no
+	// pool exists yet but servers are now configured.
+	poolManagerCreated := false
+	switch {
+	case a.poolManager != nil && poolCfgChanged:
 		if err := a.poolManager.UpdateConfig(a.config); err != nil {
 			slog.Error("Failed to update connection pool manager with new config", "error", err)
-			// Don't fail the entire config update for this, but log the error
 		} else {
 			slog.Info("Connection pool manager updated with new configuration")
 		}
-	} else if a.poolManager != nil {
+	case a.poolManager != nil:
 		slog.Info("Pool configuration unchanged, skipping pool update")
-	} else if a.poolManager == nil && len(a.config.Servers) > 0 {
-		// Create pool manager if it doesn't exist but we now have servers configured
+	case len(a.config.Servers) > 0:
+		// First-time creation: poolManager is nil and we now have servers.
 		slog.Info("Creating connection pool manager for newly configured servers")
 		poolManager, err := pool.New(a.config)
 		if err != nil {
 			slog.Error("Failed to create connection pool manager", "error", err)
-			// Don't fail the entire config update, but log the error
 		} else {
 			a.poolManager = poolManager
+			poolManagerCreated = true
 			slog.Info("Connection pool manager created successfully")
-
-			// Re-initialize processor with the new pool manager
-			if err := a.initializeProcessor(); err != nil {
-				slog.Error("Failed to re-initialize processor with new pool manager", "error", err)
-			}
 		}
 	}
 
-	// Clear any pending config since we just applied changes
-	a.pendingConfigMux.Lock()
-	a.pendingConfig = nil
-	a.pendingConfigMux.Unlock()
+	// Restart processor only when captured-at-init options changed or a new pool manager was created
+	if procNeedsRestart || poolManagerCreated {
+		if err := a.initializeProcessor(); err != nil {
+			slog.Error("Failed to re-initialize processor after config change", "error", err)
+		}
+	} else {
+		slog.Info("Processor-relevant config unchanged, skipping processor restart")
+	}
+
+	// Restart watchers only when watcher config changed
+	if watchNeedsRestart {
+		if err := a.initializeWatchers(); err != nil {
+			slog.Error("Failed to re-initialize watchers after config change", "error", err)
+		}
+	} else {
+		slog.Info("Watcher config unchanged, skipping watcher restart")
+	}
 
 	// Emit a config update event to the frontend for both desktop and web modes
 	if !a.isWebMode {
@@ -271,8 +418,8 @@ func (a *App) validateServerConnections(configData *config.ConfigData) error {
 		return nil
 	}
 
-	slog.Info("Starting server connection validation", 
-		"validServers", validServers, 
+	slog.Info("Starting server connection validation",
+		"validServers", validServers,
 		"totalServers", len(configData.Servers))
 
 	// Create a context with timeout for validation
@@ -288,7 +435,7 @@ func (a *App) validateServerConnections(configData *config.ConfigData) error {
 			continue // Skip invalid servers
 		}
 
-		slog.Debug("Validating individual server", 
+		slog.Debug("Validating individual server",
 			"index", i,
 			"host", server.Host,
 			"port", server.Port,
@@ -299,12 +446,12 @@ func (a *App) validateServerConnections(configData *config.ConfigData) error {
 			serverDesc := fmt.Sprintf("%s:%d", server.Host, server.Port)
 			failedServers = append(failedServers, serverDesc)
 			lastError = err
-			slog.Error("Server validation failed", 
+			slog.Error("Server validation failed",
 				"server", serverDesc,
 				"index", i+1,
 				"error", err)
 		} else {
-			slog.Info("Server validated successfully", 
+			slog.Info("Server validated successfully",
 				"server", fmt.Sprintf("%s:%d", server.Host, server.Port),
 				"index", i+1)
 		}
@@ -312,18 +459,18 @@ func (a *App) validateServerConnections(configData *config.ConfigData) error {
 
 	// If any servers failed, return detailed error
 	if len(failedServers) > 0 {
-		errorMsg := fmt.Sprintf("Failed to connect to %d server(s): %s", 
-			len(failedServers), 
+		errorMsg := fmt.Sprintf("Failed to connect to %d server(s): %s",
+			len(failedServers),
 			strings.Join(failedServers, ", "))
-		
+
 		if lastError != nil {
 			errorMsg = fmt.Sprintf("%s. Last error: %v", errorMsg, lastError)
 		}
-		
-		slog.Error("Server connection validation completed with failures", 
+
+		slog.Error("Server connection validation completed with failures",
 			"failedCount", len(failedServers),
 			"successCount", validServers-len(failedServers))
-		
+
 		return fmt.Errorf("%s", errorMsg)
 	}
 
@@ -354,7 +501,7 @@ func (a *App) validateIndividualServer(ctx context.Context, server *config.Serve
 				errorChan <- fmt.Errorf("validation panic: %v", r)
 			}
 		}()
-		
+
 		result := a.TestProviderConnectivity(serverData)
 		resultChan <- result
 	}()
@@ -391,7 +538,9 @@ func (a *App) SelectConfigFile() (string, error) {
 	}
 
 	if file != "" {
+		a.configFileMux.Lock()
 		a.configPath = file
+		a.configFileMux.Unlock()
 		if err := a.loadConfig(); err != nil {
 			return "", err
 		}
@@ -401,11 +550,11 @@ func (a *App) SelectConfigFile() (string, error) {
 }
 
 func (a *App) loadConfig() error {
-	if a.configPath == "" {
+	if a.GetConfigPath() == "" {
 		return fmt.Errorf("no config file specified")
 	}
 
-	cfg, err := config.Load(a.configPath)
+	cfg, err := config.Load(a.GetConfigPath())
 	if err != nil {
 		return err
 	}
@@ -437,11 +586,11 @@ func (a *App) createDefaultConfig() error {
 	// Set the database path to the OS-specific location
 	defaultConfig.Database.DatabasePath = a.appPaths.Database
 
-	if err := config.SaveConfig(&defaultConfig, a.configPath); err != nil {
+	if err := a.saveConfigFile(&defaultConfig); err != nil {
 		return fmt.Errorf("failed to save default config: %w", err)
 	}
 
-	slog.Info("Default config file created", "path", a.configPath)
+	slog.Info("Default config file created", "path", a.GetConfigPath())
 	return nil
 }
 
@@ -520,13 +669,13 @@ func (a *App) HasPendingConfigChanges() bool {
 }
 
 // GetPendingConfigStatus returns the status of pending config changes
-func (a *App) GetPendingConfigStatus() map[string]interface{} {
+func (a *App) GetPendingConfigStatus() map[string]any {
 	defer a.recoverPanic("GetPendingConfigStatus")
 
 	a.pendingConfigMux.RLock()
 	defer a.pendingConfigMux.RUnlock()
 
-	status := map[string]interface{}{
+	status := map[string]any{
 		"hasPendingConfig": a.pendingConfig != nil,
 		"canApplyNow":      !a.IsUploading(),
 	}
@@ -584,7 +733,7 @@ func (a *App) DiscardPendingConfig() error {
 	a.pendingConfig = nil
 
 	// Emit event to frontend
-	status := map[string]interface{}{
+	status := map[string]any{
 		"hasPendingConfig": false,
 		"message":          "Pending configuration changes have been discarded",
 	}
@@ -615,12 +764,14 @@ func (a *App) canProcessNextItem() bool {
 		hasActiveWork = hasActiveWork || len(runningJobs) > 0
 	}
 
-	// If no active work, try to apply pending config automatically
-	if !hasActiveWork {
+	// If no active work, try to apply pending config automatically.
+	// Use CompareAndSwap to ensure only one goroutine attempts the apply at a time.
+	if !hasActiveWork && a.isApplyingConfig.CompareAndSwap(false, true) {
 		slog.Info("No active work detected, attempting to apply pending configuration")
 
 		// Apply pending config in background to avoid blocking the processor
 		go func() {
+			defer a.isApplyingConfig.Store(false)
 			if err := a.ApplyPendingConfig(); err != nil {
 				slog.Error("Failed to auto-apply pending configuration", "error", err)
 			}

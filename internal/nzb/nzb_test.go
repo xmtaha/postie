@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/javi11/postie/internal/article"
-	"github.com/javi11/postie/internal/config"
+	"github.com/kipsilabs/postie/internal/article"
+	"github.com/kipsilabs/postie/internal/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -291,6 +291,53 @@ func TestGenerate(t *testing.T) {
 		assert.NoError(t, err, "Compressed NZB file should exist")
 	})
 
+	t.Run("folder name with dots does not get truncated at first dot", func(t *testing.T) {
+		segmentSize := uint64(1000)
+		compressionConfig := config.NzbCompressionConfig{
+			Enabled: false,
+			Type:    config.CompressionTypeNone,
+			Level:   0,
+		}
+
+		// maintainOriginalExtension=false triggers the old buggy path that split on dots
+		generator := NewGenerator(segmentSize, compressionConfig, false).(*Generator)
+
+		testArticle := &article.Article{
+			MessageID:       "test-message-id-1",
+			OriginalName:    "file.rar",
+			OriginalSubject: "Test Subject",
+			From:            "test@example.com",
+			Groups:          []string{"alt.test"},
+			PartNumber:      1,
+			TotalParts:      1,
+			Size:            500,
+			FileNumber:      1,
+			FileName:        "file.rar",
+		}
+		generator.AddArticle(testArticle)
+
+		tempDir, err := os.MkdirTemp("", "nzb-test")
+		require.NoError(t, err)
+		defer func() {
+			_ = os.RemoveAll(tempDir)
+		}()
+
+		outputPath := filepath.Join(tempDir, "Sun.Moments.nzb")
+
+		finalPath, err := generator.Generate(outputPath)
+		require.NoError(t, err, "Generate should succeed")
+
+		assert.Equal(t, outputPath, finalPath, "Returned path must equal the requested output path")
+
+		_, err = os.Stat(outputPath)
+		assert.NoError(t, err, "NZB file should exist at Sun.Moments.nzb")
+
+		// Regression guard: the old bug would create Sun.nzb instead
+		truncatedPath := filepath.Join(tempDir, "Sun.nzb")
+		_, statErr := os.Stat(truncatedPath)
+		assert.True(t, os.IsNotExist(statErr), "Sun.nzb must NOT exist (regression guard)")
+	})
+
 	t.Run("generate with no articles", func(t *testing.T) {
 		segmentSize := uint64(1000)
 		compressionConfig := config.NzbCompressionConfig{
@@ -549,4 +596,31 @@ func TestCompressWithBrotli(t *testing.T) {
 	info, err := os.Stat(tempFile.Name())
 	require.NoError(t, err, "Compressed file should exist")
 	assert.Greater(t, info.Size(), int64(0), "Compressed file should not be empty")
+}
+
+func TestRemoveFile(t *testing.T) {
+	gen := NewGenerator(1000, config.NzbCompressionConfig{}, false).(*Generator)
+	gen.AddArticle(&article.Article{MessageID: "a1", OriginalName: "video.mkv", PartNumber: 1})
+	gen.AddArticle(&article.Article{MessageID: "p1", OriginalName: "video.par2", PartNumber: 1})
+	gen.AddArticle(&article.Article{MessageID: "p2", OriginalName: "video.par2", PartNumber: 2})
+	gen.AddFileHash("video.par2", "abc")
+
+	gen.RemoveFile("video.par2")
+
+	if _, ok := gen.articles["video.par2"]; ok {
+		t.Error("articles for removed file still present")
+	}
+	if _, ok := gen.articleIdx["video.par2"]; ok {
+		t.Error("article index for removed file still present")
+	}
+	if _, ok := gen.filesHash["video.par2"]; ok {
+		t.Error("hash for removed file still present")
+	}
+	if len(gen.articles["video.mkv"]) != 1 {
+		t.Errorf("unrelated file lost articles: %d", len(gen.articles["video.mkv"]))
+	}
+
+	// Removing again, or a name never added, is a no-op.
+	gen.RemoveFile("video.par2")
+	gen.RemoveFile("never-added")
 }

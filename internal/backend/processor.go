@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/javi11/postie/internal/processor"
+	"github.com/kipsilabs/postie/internal/processor"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -38,6 +38,12 @@ func (a *App) initializeProcessor() error {
 
 	if validServers == 0 {
 		slog.Info("No valid servers configured, skipping processor initialization")
+		return nil
+	}
+
+	// Pool manager must be available to process items
+	if a.poolManager == nil {
+		slog.Warn("Pool manager not available (server configuration may be invalid), skipping processor initialization")
 		return nil
 	}
 
@@ -76,6 +82,7 @@ func (a *App) initializeProcessor() error {
 		PoolManager:               a.poolManager,
 		OutputFolder:              outputDir,
 		DeleteOriginalFile:        watcherCfg.DeleteOriginalFile,
+		DeleteDelay:               watcherCfg.MinFileAgeToDelete.ToDuration(),
 		MaintainOriginalExtension: a.config.GetMaintainOriginalExtension(),
 		WatchFolder:               watcherCfg.WatchDirectory,
 		FollowSymlinks:            watcherCfg.FollowSymlinks,
@@ -90,6 +97,13 @@ func (a *App) initializeProcessor() error {
 				runtime.EventsEmit(a.ctx, "job-error", eventData)
 			} else if a.webEventEmitter != nil {
 				a.webEventEmitter("job-error", eventData)
+			}
+		},
+		OnJobComplete: func() {
+			if !a.isWebMode {
+				runtime.EventsEmit(a.ctx, "queue-updated")
+			} else if a.webEventEmitter != nil {
+				a.webEventEmitter("queue-updated", nil)
 			}
 		},
 	})
@@ -123,13 +137,27 @@ func (a *App) initializePostCheckWorker() {
 		return
 	}
 
-	checkPool := a.poolManager.GetCheckPool()
-	if checkPool == nil {
-		slog.Warn("No check pool available, skipping deferred check worker initialization")
+	// In durable mode verification runs in the background durable service and
+	// pending_article_checks is never written (legacy rows are migrated at
+	// startup), so the legacy retry worker would only poll an empty table.
+	if a.processor.DurableMode() {
+		slog.Info("Durable verification active, skipping legacy post check retry worker")
 		return
 	}
 
-	a.postCheckWorker = processor.NewPostCheckRetryWorker(a.ctx, a.queue, checkPool, postCheckCfg)
+	checkPool := a.poolManager.GetVerifyPool()
+	if checkPool == nil {
+		slog.Warn("No verify pool available, skipping deferred check worker initialization")
+		return
+	}
+
+	a.postCheckWorker = processor.NewPostCheckRetryWorker(a.ctx, a.queue, checkPool, postCheckCfg, func() {
+		if !a.isWebMode {
+			runtime.EventsEmit(a.ctx, "queue-updated")
+		} else if a.webEventEmitter != nil {
+			a.webEventEmitter("queue-updated", nil)
+		}
+	})
 	a.postCheckWorker.Start()
 	slog.Info("Post check retry worker initialized")
 }

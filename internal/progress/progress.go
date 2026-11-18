@@ -3,6 +3,7 @@ package progress
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"sort"
@@ -22,21 +23,23 @@ const (
 )
 
 type ProgressState struct {
-	Max            int64
-	CurrentNum     int64
-	CurrentPercent float64
-	CurrentBytes   float64
-	SecondsSince   float64
-	SecondsLeft    float64
-	KBsPerSecond   float64
-	Description    string
-	Type           ProgressType
-	IsStarted      bool
-	IsPaused       bool
+	Max                  int64
+	CurrentNum           int64
+	CurrentPercent       float64
+	CurrentBytes         float64
+	SecondsSince         float64
+	SecondsLeft          float64
+	KBsPerSecond         float64
+	Description          string
+	Type                 ProgressType
+	IsStarted            bool
+	IsWaiting            bool
+	WaitSecondsRemaining float64
+	IsPaused             bool
 }
 
 // EventEmitter is a function type for emitting events to the frontend
-type EventEmitter func(eventType string, data interface{})
+type EventEmitter func(eventType string, data any)
 
 type JobProgress interface {
 	AddProgress(id uuid.UUID, name string, pType ProgressType, total int64) Progress
@@ -65,6 +68,7 @@ type Progress interface {
 	GetElapsedTime() time.Duration
 	SetPaused(paused bool)
 	IsPaused() bool
+	SetWaitDeadline(deadline time.Time)
 }
 
 type jobProgress struct {
@@ -113,6 +117,7 @@ func (pm *jobProgress) AddProgress(
 		pType:     pType,
 		total:     total,
 		startTime: time.Now(),
+		clock:     time.Now,
 		progress: progressbar.NewOptions64(
 			total,
 			progressbar.OptionSetDescription(name),
@@ -164,9 +169,7 @@ func (pm *jobProgress) GetAllProgress() map[uuid.UUID]Progress {
 	defer pm.mu.RUnlock()
 
 	result := make(map[uuid.UUID]Progress)
-	for k, v := range pm.activeProgress {
-		result[k] = v
-	}
+	maps.Copy(result, pm.activeProgress)
 	return result
 }
 
@@ -214,20 +217,53 @@ func (pm *jobProgress) SetAllPaused(paused bool) {
 }
 
 type progress struct {
-	id        uuid.UUID
-	name      string
-	pType     ProgressType
-	total     int64
-	startTime time.Time
-	progress  *progressbar.ProgressBar
-	paused    bool
-	mu        sync.RWMutex
+	id           uuid.UUID
+	name         string
+	pType        ProgressType
+	total        int64
+	startTime    time.Time
+	progress     *progressbar.ProgressBar
+	paused       bool
+	waitDeadline time.Time
+	clock        func() time.Time
+	bytes        int64
+	firstByteAt  time.Time
+	pausedAt     time.Time
+	pausedTotal  time.Duration
+	mu           sync.RWMutex
+}
+
+// activeSeconds is the time spent actually transferring: from the first byte
+// onwards, minus any paused intervals. Wall-clock time since the bar was
+// created includes queue waits and pauses, which made the displayed speed
+// meaningless for jobs that sat behind other uploads.
+func (p *progress) activeSeconds(now time.Time) float64 {
+	if p.firstByteAt.IsZero() {
+		return 0
+	}
+	active := now.Sub(p.firstByteAt) - p.pausedTotal
+	if !p.pausedAt.IsZero() {
+		active -= now.Sub(p.pausedAt)
+	}
+	return active.Seconds()
 }
 
 func (p *progress) UpdateProgress(processed int64) {
 	if p.progress.IsFinished() {
 		return
 	}
+
+	p.mu.Lock()
+	if p.firstByteAt.IsZero() {
+		now := p.clock()
+		p.firstByteAt = now
+		p.pausedTotal = 0
+		if p.paused {
+			p.pausedAt = now
+		}
+	}
+	p.bytes += processed
+	p.mu.Unlock()
 
 	_ = p.progress.Add64(processed)
 }
@@ -253,7 +289,30 @@ func (p *progress) GetState() ProgressState {
 	s := p.progress.State()
 	p.mu.RLock()
 	paused := p.paused
+	waitDeadline := p.waitDeadline
+	now := p.clock()
+	bytes := p.bytes
+	activeSecs := p.activeSeconds(now)
 	p.mu.RUnlock()
+
+	kbsPerSecond := 0.0
+	secondsLeft := 0.0
+	if bytes > 0 && activeSecs > 0 {
+		kbsPerSecond = float64(bytes) / 1024.0 / activeSecs
+		if remaining := p.total - bytes; remaining > 0 {
+			secondsLeft = float64(remaining) / (kbsPerSecond * 1024.0)
+		}
+	}
+
+	secsRemaining := 0.0
+	isWaiting := false
+	if !waitDeadline.IsZero() {
+		remaining := time.Until(waitDeadline).Seconds()
+		if remaining > 0 {
+			isWaiting = true
+			secsRemaining = remaining
+		}
+	}
 
 	// Sanitize float64 values to prevent NaN in JSON serialization
 	currentPercent := s.CurrentPercent
@@ -271,28 +330,20 @@ func (p *progress) GetState() ProgressState {
 		secondsSince = 0.0
 	}
 
-	secondsLeft := s.SecondsLeft
-	if math.IsNaN(secondsLeft) || math.IsInf(secondsLeft, 0) {
-		secondsLeft = 0.0
-	}
-
-	kbsPerSecond := s.KBsPerSecond
-	if math.IsNaN(kbsPerSecond) || math.IsInf(kbsPerSecond, 0) {
-		kbsPerSecond = 0.0
-	}
-
 	return ProgressState{
-		Max:            s.Max,
-		CurrentNum:     s.CurrentNum,
-		CurrentPercent: currentPercent,
-		CurrentBytes:   currentBytes,
-		SecondsSince:   secondsSince,
-		SecondsLeft:    secondsLeft,
-		KBsPerSecond:   kbsPerSecond,
-		Description:    s.Description,
-		Type:           p.pType,
-		IsStarted:      s.CurrentNum > 0,
-		IsPaused:       paused,
+		Max:                  s.Max,
+		CurrentNum:           s.CurrentNum,
+		CurrentPercent:       currentPercent,
+		CurrentBytes:         currentBytes,
+		SecondsSince:         secondsSince,
+		SecondsLeft:          secondsLeft,
+		KBsPerSecond:         kbsPerSecond,
+		Description:          s.Description,
+		Type:                 p.pType,
+		IsStarted:            s.CurrentNum > 0,
+		IsWaiting:            isWaiting,
+		WaitSecondsRemaining: secsRemaining,
+		IsPaused:             paused,
 	}
 }
 
@@ -331,11 +382,27 @@ func (p *progress) GetLeftTime() time.Duration {
 func (p *progress) SetPaused(paused bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if paused == p.paused {
+		return
+	}
 	p.paused = paused
+	now := p.clock()
+	if paused {
+		p.pausedAt = now
+		return
+	}
+	p.pausedTotal += now.Sub(p.pausedAt)
+	p.pausedAt = time.Time{}
 }
 
 func (p *progress) IsPaused() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.paused
+}
+
+func (p *progress) SetWaitDeadline(deadline time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.waitDeadline = deadline
 }

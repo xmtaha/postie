@@ -3,7 +3,8 @@
 import { browser } from "$app/environment";
 import type { backend, config, processor, watcher } from "$lib/wailsjs/go/models";
 // Using backend types for pagination - remove temporary types import
-import type { WebClient } from "./web-client";
+import type { ArrInstance, WebClient } from "./web-client";
+export type { ArrInstance };
 
 type WailsApp = typeof import("$lib/wailsjs/go/backend/App");
 type WailsRuntime = typeof import("$lib/wailsjs/runtime/runtime");
@@ -103,7 +104,7 @@ export class UnifiedClient {
 	}
 
 	private async waitForWailsRuntime(): Promise<void> {
-		const maxAttempts = 50; // Max 5 seconds (50 * 100ms)
+		const maxAttempts = 100; // Max 10 seconds (100 * 100ms) for slow Windows machines
 		let attempts = 0;
 
 		while (attempts < maxAttempts) {
@@ -114,7 +115,8 @@ export class UnifiedClient {
 			attempts++;
 		}
 
-		throw new Error("Wails runtime not available after timeout");
+		console.warn("Wails runtime not available after timeout, proceeding anyway");
+		// Don't throw — let individual API calls fail gracefully
 	}
 
 	// App Status
@@ -156,10 +158,6 @@ export class UnifiedClient {
 
 		if (this._environment === "wails") {
 			const client = await getWailsClient();
-			// #region agent log
-			// Debug instrumentation (no secrets): capture duration-like fields before calling backend.SaveConfig
-			fetch('http://127.0.0.1:7242/ingest/179798b3-2a7a-4cca-82ff-855a1b657b1f',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'A',location:'frontend/src/lib/api/client.ts:saveConfig',message:'About to call backend.App.SaveConfig (wails)',data:{posting_retry_delay:(config as any)?.posting?.retry_delay,posting_retry_delay_type:typeof (config as any)?.posting?.retry_delay,post_check_delay:(config as any)?.post_check?.delay,post_check_delay_type:typeof (config as any)?.post_check?.delay,connection_pool_hc:(config as any)?.connection_pool?.health_check_interval,connection_pool_hc_type:typeof (config as any)?.connection_pool?.health_check_interval,watcher_check_interval:(config as any)?.watcher?.check_interval,watcher_check_interval_type:typeof (config as any)?.watcher?.check_interval,post_upload_script_timeout:(config as any)?.post_upload_script?.timeout,post_upload_script_timeout_type:typeof (config as any)?.post_upload_script?.timeout,post_upload_script_retry_delay:(config as any)?.post_upload_script?.retry_delay,post_upload_script_retry_delay_type:typeof (config as any)?.post_upload_script?.retry_delay,post_upload_script_max_retries:(config as any)?.post_upload_script?.max_retries,servers_count:Array.isArray((config as any)?.servers)?(config as any).servers.length:0},timestamp:Date.now()})}).catch(()=>{});
-			// #endregion agent log
 			return client.App.SaveConfig(
 				config as unknown as import("$lib/wailsjs/go/models").config.ConfigData,
 			);
@@ -279,7 +277,7 @@ export class UnifiedClient {
 		throw new Error("No client available");
 	}
 
-	async getWatcherStatus(): Promise<watcher.WatcherStatusInfo> {
+	async getWatcherStatus(): Promise<watcher.WatcherStatusInfo[]> {
 		await this.initialize();
 
 		if (this._environment === "wails") {
@@ -290,6 +288,54 @@ export class UnifiedClient {
 		if (this._environment === "web") {
 			const client = await getWebClient();
 			return client.getWatcherStatus();
+		}
+
+		throw new Error("No client available");
+	}
+
+	async triggerScan(): Promise<void> {
+		await this.initialize();
+
+		if (this._environment === "wails") {
+			const client = await getWailsClient();
+			return client.App.TriggerScan();
+		}
+
+		if (this._environment === "web") {
+			const client = await getWebClient();
+			return client.triggerScan();
+		}
+
+		throw new Error("No client available");
+	}
+
+	async getApiKey(): Promise<string> {
+		await this.initialize();
+
+		if (this._environment === "wails") {
+			const client = await getWailsClient();
+			return client.App.GetAPIKey();
+		}
+
+		if (this._environment === "web") {
+			const client = await getWebClient();
+			return client.getApiKey();
+		}
+
+		throw new Error("No client available");
+	}
+
+	async regenerateApiKey(): Promise<string> {
+		await this.initialize();
+
+		if (this._environment === "wails") {
+			const client = await getWailsClient();
+			return client.App.RegenerateAPIKey();
+		}
+
+		if (this._environment === "web") {
+			const client = await getWebClient();
+			return client.regenerateApiKey();
 		}
 
 		throw new Error("No client available");
@@ -461,6 +507,31 @@ export class UnifiedClient {
 		throw new Error("Use uploadFileList for web folder uploads");
 	}
 
+	async selectFolders(): Promise<string[]> {
+		await this.initialize();
+
+		if (this._environment === "wails") {
+			const client = await getWailsClient();
+			const paths = await client.App.SelectFolders();
+			return paths ?? [];
+		}
+
+		// In web mode, folder selection is handled via HTML input with webkitdirectory
+		return [];
+	}
+
+	async uploadFolders(folderPaths: string[]): Promise<void> {
+		await this.initialize();
+
+		if (this._environment === "wails") {
+			const client = await getWailsClient();
+			return client.App.UploadFolders(folderPaths);
+		}
+
+		// In web mode, folder upload is handled via uploadFileList with webkitdirectory files
+		throw new Error("Use uploadFileList for web folder uploads");
+	}
+
 	// Logs
 	async getLogs(): Promise<string> {
 		await this.initialize();
@@ -547,6 +618,28 @@ export class UnifiedClient {
 			const client = await getWebClient();
 			client.off(event);
 		}
+	}
+
+	// True when push events are flowing. Wails events cannot silently drop;
+	// in web mode this requires an OPEN WebSocket with recent event traffic.
+	isLive(): boolean {
+		if (this._environment === "wails") return true;
+		if (this._environment === "web") return webClient?.isConnected() ?? false;
+		return false;
+	}
+
+	onReconnect(callback: () => void): () => void {
+		if (this._environment !== "web") return () => {};
+		let unsubscribe: (() => void) | undefined;
+		let cancelled = false;
+		getWebClient().then((client) => {
+			if (cancelled) return;
+			unsubscribe = client.onReconnect(callback);
+		});
+		return () => {
+			cancelled = true;
+			unsubscribe?.();
+		};
 	}
 
 	// Queue Actions
@@ -823,6 +916,22 @@ export class UnifiedClient {
 		throw new Error("No client available");
 	}
 
+	async getTransferRuntimeMetrics(): Promise<backend.TransferRuntimeMetrics> {
+		await this.initialize();
+
+		if (this._environment === "wails") {
+			const client = await getWailsClient();
+			return client.App.GetTransferRuntimeMetrics();
+		}
+
+		if (this._environment === "web") {
+			const client = await getWebClient();
+			return client.getTransferRuntimeMetrics();
+		}
+
+		throw new Error("No client available");
+	}
+
 	// Filesystem operations (web-only)
 	async browseFilesystem(path: string): Promise<{
 		path: string;
@@ -865,6 +974,52 @@ export class UnifiedClient {
 		}
 
 		throw new Error("No client available");
+	}
+
+	// ── Arr webhook integration (web mode only) ────────────────────────────
+
+	async getArrInstances(): Promise<ArrInstance[]> {
+		await this.initialize();
+
+		if (this._environment === "web") {
+			const client = await getWebClient();
+			return client.getArrInstances();
+		}
+
+		throw new Error("Arr webhook integration is only available in web mode");
+	}
+
+	async addArrInstance(instance: ArrInstance): Promise<ArrInstance> {
+		await this.initialize();
+
+		if (this._environment === "web") {
+			const client = await getWebClient();
+			return client.addArrInstance(instance);
+		}
+
+		throw new Error("Arr webhook integration is only available in web mode");
+	}
+
+	async removeArrInstance(id: string): Promise<void> {
+		await this.initialize();
+
+		if (this._environment === "web") {
+			const client = await getWebClient();
+			return client.removeArrInstance(id);
+		}
+
+		throw new Error("Arr webhook integration is only available in web mode");
+	}
+
+	async testArrConnection(instance: ArrInstance): Promise<void> {
+		await this.initialize();
+
+		if (this._environment === "web") {
+			const client = await getWebClient();
+			return client.testArrConnection(instance);
+		}
+
+		throw new Error("Arr webhook integration is only available in web mode");
 	}
 }
 

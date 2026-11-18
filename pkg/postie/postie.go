@@ -10,28 +10,66 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/javi11/postie/internal/config"
-	"github.com/javi11/postie/internal/nzb"
-	"github.com/javi11/postie/internal/par2"
-	"github.com/javi11/postie/internal/pool"
-	"github.com/javi11/postie/internal/poster"
-	"github.com/javi11/postie/internal/progress"
-	"github.com/javi11/postie/pkg/fileinfo"
+	"github.com/kipsilabs/postie/internal/config"
+	"github.com/kipsilabs/postie/internal/duplicatelookup"
+	"github.com/kipsilabs/postie/internal/nzb"
+	"github.com/kipsilabs/postie/internal/par2"
+	"github.com/kipsilabs/postie/internal/pool"
+	"github.com/kipsilabs/postie/internal/poster"
+	"github.com/kipsilabs/postie/internal/progress"
+	"github.com/kipsilabs/postie/internal/transferwriter"
+	"github.com/kipsilabs/postie/pkg/fileinfo"
 	"golang.org/x/sync/errgroup"
 )
 
 type Postie struct {
+	duplicateLookupCfg        config.DuplicateLookupConfig
+	reusedSources             map[string]bool
 	par2Cfg                   *config.Par2Config
 	postingCfg                config.PostingConfig
-	par2runner                *par2.NativeExecutor
+	par2runner                par2.Par2Executor
 	poster                    poster.Poster
 	compressionCfg            config.NzbCompressionConfig
 	postUploadScriptCfg       config.PostUploadScriptConfig
 	maintainOriginalExtension bool
+	postCheckCfg              config.PostCheck
 	jobProgress               progress.JobProgress
 	queue                     QueueInterface
+	// recorder is the per-job durable manifest recorder, or nil in standalone
+	// mode. When set, the poster writes manifests during upload and Postie marks
+	// the transfer's files uploaded (for the durable verification service) once
+	// posting completes.
+	recorder *transferwriter.Recorder
+	// par2Reserver keeps the PAR2 files this job posts out of the work-dir
+	// sweeper's reach until Close. Nil when there is no runtime.
+	par2Reserver par2Reserver
+	// reservedPar2 accumulates the PAR2 files reserved for this job, for release.
+	reservedMu   sync.Mutex
+	reservedPar2 []string
+	// deleteOriginal records whether this job's originals should be deleted
+	// after successful verification (persisted into the transfer's cleanup
+	// policy at completion). Set by the caller before Post.
+	deleteOriginal bool
+	// sourcePaths holds every source file of the current Post call. In
+	// individual-file mode a reused PAR2 file that is itself a source gets its
+	// own NZB, so it must not also be attached to a sibling's NZB.
+	sourcePaths []string
+}
+
+// par2Reserver is the subset of Runtime used to protect in-flight PAR2 files.
+type par2Reserver interface {
+	ReservePar2(paths ...string)
+	ReleasePar2(paths ...string)
+}
+
+// SetDeleteOriginal records whether the job's original files should be deleted
+// after the durable verification service confirms the upload. Must be called
+// before Post. No effect in standalone mode (deletion is handled inline there).
+func (p *Postie) SetDeleteOriginal(v bool) {
+	p.deleteOriginal = v
 }
 
 // QueueInterface defines the queue methods needed by Postie
@@ -40,12 +78,33 @@ type QueueInterface interface {
 	MarkScriptCompleted(ctx context.Context, itemID string) error
 }
 
+// New creates a Postie that owns a private transfer runtime. It is retained as
+// a compatibility entry point for the CLI and external package users; the
+// processor path uses NewWithRuntime to share one process-wide runtime across
+// all jobs.
 func New(
 	ctx context.Context,
 	cfg config.Config,
 	poolManager *pool.Manager,
 	jobProgress progress.JobProgress,
 	queue QueueInterface,
+) (*Postie, error) {
+	return NewWithRuntime(ctx, cfg, poolManager, jobProgress, queue, nil, "")
+}
+
+// NewWithRuntime creates a Postie that borrows shared resources from rt. When
+// rt is nil a private PAR2 scheduler is created honouring the configured
+// par2.max_concurrent_jobs, preserving standalone behaviour. transferID binds
+// this job's durable manifests; when empty (or rt has no store) manifest
+// recording is disabled.
+func NewWithRuntime(
+	ctx context.Context,
+	cfg config.Config,
+	poolManager *pool.Manager,
+	jobProgress progress.JobProgress,
+	queue QueueInterface,
+	rt *Runtime,
+	transferID string,
 ) (*Postie, error) {
 	// Get PAR2 configuration
 	par2Cfg, err := cfg.GetPar2Config(ctx)
@@ -58,18 +117,47 @@ func New(
 	postUploadScriptConfig := cfg.GetPostUploadScriptConfig()
 	maintainOriginalExtension := cfg.GetMaintainOriginalExtension()
 
-	// Create par2 runner with progress manager
-	par2runner := par2.New(postingConfig.ArticleSizeInBytes, par2Cfg, jobProgress)
+	// Create the per-job PAR2 executor (carries this job's progress + config),
+	// then gate its execution through the shared, process-wide PAR2 scheduler so
+	// the configured memory limit applies per active job rather than per queue
+	// job. Falls back to a private scheduler when no runtime is supplied.
+	par2Executor := par2.NewExecutor(postingConfig.ArticleSizeInBytes, par2Cfg, jobProgress)
+	par2Scheduler := rt.Par2Scheduler()
+	if par2Scheduler == nil {
+		maxJobs := 1
+		if par2Cfg != nil && par2Cfg.MaxConcurrentJobs > 0 {
+			maxJobs = par2Cfg.MaxConcurrentJobs
+		}
+		par2Scheduler = par2.NewScheduler(maxJobs)
+	}
+	par2runner := par2.NewScheduledExecutor(par2Executor, par2Scheduler)
 
-	// Create poster with progress manager
-	p, err := poster.New(ctx, cfg, poolManager, jobProgress)
+	// Build the per-job durable manifest recorder (nil in standalone mode). It
+	// doubles as the poster's manifest sink; pass an untyped-nil sink when
+	// absent to avoid a non-nil interface wrapping a nil pointer.
+	recorder := rt.NewManifestRecorder(transferID)
+	var sink poster.ManifestSink
+	if recorder != nil {
+		sink = recorder
+	}
+
+	// Create poster with progress manager, sharing the process-wide upload
+	// engine (worker + buffer-budget limits) and the per-job manifest sink.
+	p, err := poster.NewWithEngine(ctx, cfg, poolManager, jobProgress, rt.UploadEngine(), sink)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error creating poster", "error", err)
 
 		return nil, err
 	}
 
+	var duplicateCfg config.DuplicateLookupConfig
+	if source, ok := cfg.(interface {
+		GetDuplicateLookupConfig() config.DuplicateLookupConfig
+	}); ok {
+		duplicateCfg = source.GetDuplicateLookupConfig()
+	}
 	return &Postie{
+		duplicateLookupCfg:        duplicateCfg,
 		par2Cfg:                   par2Cfg,
 		par2runner:                par2runner,
 		poster:                    p,
@@ -77,9 +165,69 @@ func New(
 		compressionCfg:            compressionConfig,
 		postUploadScriptCfg:       postUploadScriptConfig,
 		maintainOriginalExtension: maintainOriginalExtension,
+		postCheckCfg:              cfg.GetPostCheckConfig(),
 		jobProgress:               jobProgress,
 		queue:                     queue,
+		recorder:                  recorder,
+		par2Reserver:              reserverFor(rt),
 	}, nil
+}
+
+// reserverFor returns rt as a par2Reserver, or nil for a nil runtime so the
+// interface itself is nil (a typed nil pointer would not compare to nil).
+func reserverFor(rt *Runtime) par2Reserver {
+	if rt == nil {
+		return nil
+	}
+	return rt
+}
+
+// removePar2AfterPost reports whether generated PAR2 files should be deleted as
+// soon as posting succeeds. Only in standalone mode with maintain_par2_files
+// off: in durable mode the background verification may still need to re-post
+// PAR2 articles from those files, and the transfer cleaner removes them once
+// the transfer is verified.
+func (p *Postie) removePar2AfterPost() bool {
+	if p.recorder != nil {
+		return false
+	}
+	return p.par2Cfg.MaintainPar2Files == nil || !*p.par2Cfg.MaintainPar2Files
+}
+
+// trackGenerated registers the PAR2 files this job is about to post. The
+// durable recorder records only the ones Postie created as generated (so the
+// cleaner may delete them later, while reused PAR2 files stay originals). All
+// of them, reused included, are reserved so the work-dir sweeper cannot remove
+// a set between here and the end of the upload: a reused set in the work dir
+// may be an old orphan that no transfer row protects yet.
+func (p *Postie) trackGenerated(res par2.Result) {
+	all := res.All()
+	if len(all) == 0 {
+		return
+	}
+	if p.recorder != nil && len(res.Created) > 0 {
+		p.recorder.MarkGenerated(res.Created...)
+	}
+	if p.par2Reserver != nil {
+		p.par2Reserver.ReservePar2(all...)
+	}
+	p.reservedMu.Lock()
+	p.reservedPar2 = append(p.reservedPar2, all...)
+	p.reservedMu.Unlock()
+}
+
+// completeTransferUpload marks the transfer's files uploaded so the durable
+// verification service can verify them, scheduling the first check after the
+// configured propagation delay. No-op in standalone mode (no recorder).
+func (p *Postie) completeTransferUpload(ctx context.Context) {
+	if p.recorder == nil {
+		return
+	}
+	delay := p.postCheckCfg.RetryDelay.ToDuration()
+	now := time.Now().UTC()
+	if err := p.recorder.CompleteUpload(ctx, now, now.Add(delay), p.deleteOriginal); err != nil {
+		slog.WarnContext(ctx, "Failed to mark transfer uploaded for verification", "error", err)
+	}
 }
 
 func (p *Postie) Close() {
@@ -87,15 +235,20 @@ func (p *Postie) Close() {
 	if p.jobProgress != nil {
 		p.jobProgress.Close()
 	}
+	if p.par2Reserver != nil {
+		p.reservedMu.Lock()
+		paths := p.reservedPar2
+		p.reservedPar2 = nil
+		p.reservedMu.Unlock()
+		p.par2Reserver.ReleasePar2(paths...)
+	}
 }
 
 // CleanupPar2Files removes PAR2 files for the given source file
 // This method can be called when a job fails permanently to clean up orphaned PAR2 files
 func (p *Postie) CleanupPar2Files(ctx context.Context, sourceFile fileinfo.FileInfo) {
-	var dirPath string
-	if p.par2Cfg != nil && p.par2Cfg.TempDir != "" {
-		dirPath = p.par2Cfg.TempDir
-	} else {
+	dirPath := par2.WorkDir(p.par2Cfg)
+	if dirPath == "" {
 		dirPath = filepath.Dir(sourceFile.Path)
 	}
 
@@ -137,7 +290,7 @@ func safeRemoveFile(ctx context.Context, filePath string) {
 	maxRetries := 3
 	baseDelay := 100 * time.Millisecond
 
-	for i := 0; i < maxRetries; i++ {
+	for i := range maxRetries {
 		if err := os.Remove(filePath); err == nil {
 			return // Success
 		}
@@ -159,10 +312,30 @@ func safeRemoveFile(ctx context.Context, filePath string) {
 	_ = os.Remove(filePath)
 }
 
-func (p *Postie) Post(ctx context.Context, files []fileinfo.FileInfo, rootDir string, outputDir string, forceFolderMode bool) (string, error) {
+func (p *Postie) Post(ctx context.Context, files []fileinfo.FileInfo, rootDir string, outputDir string, forceFolderMode bool) (nzbPath string, retErr error) {
 	if len(files) == 0 {
 		return "", fmt.Errorf("no files to post")
 	}
+
+	p.reusedSources = make(map[string]bool)
+	p.sourcePaths = make([]string, len(files))
+	for i, f := range files {
+		p.sourcePaths[i] = f.Path
+	}
+
+	// On a successful upload, mark the transfer's files uploaded so the durable
+	// verification service picks them up and the queue slot can be released.
+	// In durable mode the in-poster checkLoop is skipped, so a nil error here
+	// means posting succeeded with nothing left to verify inline. No-op in
+	// standalone mode (no recorder).
+	defer func() {
+		if retErr == nil && len(p.reusedSources) < len(files) {
+			if len(p.reusedSources) > 0 {
+				p.deleteOriginal = false
+			}
+			p.completeTransferUpload(ctx)
+		}
+	}()
 
 	// Use folder mode (single NZB) if explicitly requested via forceFolderMode
 	// This is set to true for:
@@ -183,6 +356,22 @@ func (p *Postie) Post(ctx context.Context, files []fileinfo.FileInfo, rootDir st
 
 		var nzbPath string
 		var err error
+		if p.duplicateLookupCfg.Enabled {
+			data, lookupErr := duplicatelookup.Lookup(ctx, p.duplicateLookupCfg.URL, p.duplicateLookupCfg.APIKey, p.duplicateLookupCfg.Timeout.ToDuration(), f.Path)
+			if lookupErr != nil {
+				return "", fmt.Errorf("duplicate lookup: %w", lookupErr)
+			}
+			if len(data) > 0 {
+				target := filepath.Join(outputDir, relativePathFrom(rootDir, f.Path), filepath.Base(f.Path))
+				saved, saveErr := nzb.SaveExisting(ctx, data, target, p.compressionCfg, p.maintainOriginalExtension)
+				if saveErr != nil {
+					return "", saveErr
+				}
+				p.reusedSources[f.Path] = true
+				lastNzbPath = saved
+				continue
+			}
+		}
 		if *p.postingCfg.WaitForPar2 {
 			nzbPath, err = p.post(ctx, f, rootDir, outputDir)
 		} else {
@@ -202,6 +391,9 @@ func (p *Postie) Post(ctx context.Context, files []fileinfo.FileInfo, rootDir st
 	}
 
 	// Print final statistics
+	if len(p.reusedSources) == len(files) {
+		return lastNzbPath, nil
+	}
 	stats := p.poster.Stats()
 	elapsed := time.Since(startTime)
 
@@ -225,7 +417,7 @@ func (p *Postie) postInParallel(
 	outputDir string,
 ) (string, error) {
 	var (
-		createdPar2Paths []string
+		par2Res          par2.Result
 		err              error
 		postingSucceeded bool
 	)
@@ -236,11 +428,8 @@ func (p *Postie) postInParallel(
 			return
 		}
 
-		// Only clean up if maintain_par2_files is disabled
-		// If enabled, files are already in output directory - no action needed
-		if p.par2Cfg.MaintainPar2Files == nil || !*p.par2Cfg.MaintainPar2Files {
-			// Clean up PAR2 files when maintain_par2_files is disabled (default)
-			for _, path := range createdPar2Paths {
+		if p.removePar2AfterPost() {
+			for _, path := range par2Res.Created {
 				safeRemoveFile(ctx, path)
 			}
 		}
@@ -255,8 +444,7 @@ func (p *Postie) postInParallel(
 		var par2OutputDir string
 		if p.par2Cfg.MaintainPar2Files != nil && *p.par2Cfg.MaintainPar2Files {
 			// Generate PAR2 files directly in output directory
-			dirPath := filepath.Dir(f.Path)
-			relativePath := strings.TrimPrefix(dirPath, rootDir)
+			relativePath := relativePathFrom(rootDir, f.Path)
 			par2OutputDir = filepath.Join(outputDir, relativePath)
 
 			slog.DebugContext(ctx, "Generating PAR2 files directly in output directory",
@@ -264,7 +452,7 @@ func (p *Postie) postInParallel(
 		}
 		// If par2OutputDir is empty, CreateInDirectory will use default behavior (temp/source dir)
 
-		createdPar2Paths, err = p.par2runner.CreateInDirectory(ctx, []fileinfo.FileInfo{f}, par2OutputDir)
+		par2Res, err = p.par2runner.CreateInDirectory(ctx, []fileinfo.FileInfo{f}, par2OutputDir)
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				slog.ErrorContext(ctx, "Error during par2 creation. Upload will continue without par2.", "error", err)
@@ -272,11 +460,17 @@ func (p *Postie) postInParallel(
 
 			return nil
 		}
+		p.trackGenerated(par2Res)
 
-		if err := p.poster.Post(ctx, createdPar2Paths, rootDir, nzbGen); err != nil {
+		par2Paths := additionalPar2Paths(par2Res.All(), p.sourcePaths)
+		if len(par2Paths) == 0 {
+			return nil
+		}
+		if err := p.poster.Post(ctx, par2Paths, rootDir, nzbGen); err != nil {
 			if !errors.Is(err, context.Canceled) {
-				slog.ErrorContext(ctx, fmt.Sprintf("Error during upload of par2 files: %s. Upload will continue without par2.", createdPar2Paths), "error", err)
+				slog.ErrorContext(ctx, fmt.Sprintf("Error during upload of par2 files: %s. Upload will continue without par2.", par2Paths), "error", err)
 			}
+			dropPar2FromNZB(nzbGen, par2Paths)
 
 			return nil
 		}
@@ -307,13 +501,17 @@ func (p *Postie) postInParallel(
 	if err := errg.Wait(); err != nil {
 		return "", err
 	}
+	// The optional PAR2 branch tolerates errors; cancellation must still stop
+	// NZB publication and preserve recovery files for a later attempt.
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 
 	// Generate single NZB file for all files
-	dirPath := filepath.Dir(f.Path)
-	dirPath = strings.TrimPrefix(dirPath, rootDir)
+	relativePath := relativePathFrom(rootDir, f.Path)
 
 	// Use the original filename as input for NZB generation
-	nzbPath := filepath.Join(outputDir, dirPath, filepath.Base(f.Path))
+	nzbPath := filepath.Join(outputDir, relativePath, filepath.Base(f.Path))
 	finalPath, err := nzbGen.Generate(nzbPath)
 	if err != nil {
 		return "", fmt.Errorf("error generating NZB file: %w", err)
@@ -336,7 +534,7 @@ func (p *Postie) post(
 	outputDir string,
 ) (string, error) {
 	var (
-		createdPar2Paths []string
+		par2Res          par2.Result
 		err              error
 		postingSucceeded bool
 	)
@@ -348,11 +546,8 @@ func (p *Postie) post(
 			return
 		}
 
-		// Only clean up if maintain_par2_files is disabled
-		// If enabled, files are already in output directory - no action needed
-		if p.par2Cfg.MaintainPar2Files == nil || !*p.par2Cfg.MaintainPar2Files {
-			// Clean up PAR2 files when maintain_par2_files is disabled (default)
-			for _, path := range createdPar2Paths {
+		if p.removePar2AfterPost() {
+			for _, path := range par2Res.Created {
 				safeRemoveFile(ctx, path)
 			}
 		}
@@ -366,8 +561,7 @@ func (p *Postie) post(
 		var par2OutputDir string
 		if p.par2Cfg.MaintainPar2Files != nil && *p.par2Cfg.MaintainPar2Files {
 			// Generate PAR2 files directly in output directory
-			dirPath := filepath.Dir(f.Path)
-			relativePath := strings.TrimPrefix(dirPath, rootDir)
+			relativePath := relativePathFrom(rootDir, f.Path)
 			par2OutputDir = filepath.Join(outputDir, relativePath)
 
 			slog.DebugContext(ctx, "Generating PAR2 files directly in output directory",
@@ -375,7 +569,7 @@ func (p *Postie) post(
 		}
 		// If par2OutputDir is empty, CreateInDirectory will use default behavior (temp/source dir)
 
-		createdPar2Paths, err = p.par2runner.CreateInDirectory(ctx, []fileinfo.FileInfo{f}, par2OutputDir)
+		par2Res, err = p.par2runner.CreateInDirectory(ctx, []fileinfo.FileInfo{f}, par2OutputDir)
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				slog.ErrorContext(ctx, "Error during par2 creation. Upload will continue without par2.", "error", err)
@@ -383,8 +577,9 @@ func (p *Postie) post(
 
 			return "", err
 		}
+		p.trackGenerated(par2Res)
 
-		filesPath = append(filesPath, createdPar2Paths...)
+		filesPath = append(filesPath, additionalPar2Paths(par2Res.All(), p.sourcePaths)...)
 	}
 
 	var deferredErr *poster.DeferredCheckError
@@ -401,11 +596,10 @@ func (p *Postie) post(
 	}
 
 	// Generate single NZB file for all files
-	dirPath := filepath.Dir(f.Path)
-	dirPath = strings.TrimPrefix(dirPath, rootDir)
+	relativePath := relativePathFrom(rootDir, f.Path)
 
 	// Use the original filename as input for NZB generation
-	nzbPath := filepath.Join(outputDir, dirPath, filepath.Base(f.Path))
+	nzbPath := filepath.Join(outputDir, relativePath, filepath.Base(f.Path))
 	finalPath, err := nzbGen.Generate(nzbPath)
 	if err != nil {
 		return "", fmt.Errorf("error generating NZB file: %w", err)
@@ -421,6 +615,45 @@ func (p *Postie) post(
 	return finalPath, nil
 }
 
+// dropPar2FromNZB removes the PAR2 files from the NZB after their upload
+// failed part-way: the articles posted before the failure were already added
+// to the generator, and an NZB pointing at an incomplete PAR2 set is worse
+// than one without PAR2 (downloaders try to repair with volumes that are not
+// there). The main files remain untouched.
+func dropPar2FromNZB(nzbGen nzb.NZBGenerator, par2Paths []string) {
+	for _, path := range par2Paths {
+		nzbGen.RemoveFile(filepath.Base(path))
+	}
+}
+
+// hasPar2Files returns true if any file in the list is a PAR2 file.
+func hasPar2Files(files []fileinfo.FileInfo) bool {
+	for _, f := range files {
+		if par2.IsPar2File(f.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+// additionalPar2Paths excludes files already posted through the source list.
+// Reused source PAR2 files must keep their relative paths and be uploaded once.
+func additionalPar2Paths(paths []string, sourcePaths []string) []string {
+	seen := make(map[string]bool, len(sourcePaths)+len(paths))
+	for _, path := range sourcePaths {
+		seen[filepath.Clean(path)] = true
+	}
+	var additional []string
+	for _, path := range paths {
+		key := filepath.Clean(path)
+		if !seen[key] {
+			seen[key] = true
+			additional = append(additional, path)
+		}
+	}
+	return additional
+}
+
 // postFolder posts all files from a folder as a single NZB
 func (p *Postie) postFolder(ctx context.Context, files []fileinfo.FileInfo, rootDir string, outputDir string) (string, error) {
 	if len(files) == 0 {
@@ -429,20 +662,15 @@ func (p *Postie) postFolder(ctx context.Context, files []fileinfo.FileInfo, root
 
 	startTime := time.Now()
 
-	// Determine the folder name from the first file's path
-	// This will be used as the NZB filename
-	firstFilePath := files[0].Path
-	folderPath := filepath.Dir(firstFilePath)
-	folderName := filepath.Base(folderPath)
-	if folderName == "." || folderName == "/" {
-		// If files are in root, use a default name
-		folderName = "upload"
-	}
+	folderName := deriveFolderName(rootDir, files)
+	// All generated files (NZB and PAR2) go into a dedicated subfolder named after
+	// the source folder, regardless of whether watch and output are on the same volume.
+	folderOutputDir := filepath.Join(outputDir, folderName)
 
 	slog.InfoContext(ctx, "Posting folder as single NZB", "folder", folderName, "files", len(files))
 
 	var (
-		createdPar2Paths []string
+		par2Res          par2.Result
 		err              error
 		postingSucceeded bool
 	)
@@ -454,11 +682,8 @@ func (p *Postie) postFolder(ctx context.Context, files []fileinfo.FileInfo, root
 			return
 		}
 
-		// Only clean up if maintain_par2_files is disabled
-		// If enabled, files are already in output directory - no action needed
-		if p.par2Cfg.MaintainPar2Files == nil || !*p.par2Cfg.MaintainPar2Files {
-			// Clean up PAR2 files when maintain_par2_files is disabled (default)
-			for _, path := range createdPar2Paths {
+		if p.removePar2AfterPost() {
+			for _, path := range par2Res.Created {
 				safeRemoveFile(ctx, path)
 			}
 		}
@@ -481,25 +706,37 @@ func (p *Postie) postFolder(ctx context.Context, files []fileinfo.FileInfo, root
 	if *p.postingCfg.WaitForPar2 {
 		// Create PAR2 files for all files in the folder
 		if *p.par2Cfg.Enabled {
-			// Determine PAR2 output directory based on maintain_par2_files setting
-			var par2OutputDir string
-			if p.par2Cfg.MaintainPar2Files != nil && *p.par2Cfg.MaintainPar2Files {
-				// For folder posting, PAR2 files go directly in outputDir
-				par2OutputDir = outputDir
-
-				slog.DebugContext(ctx, "Generating PAR2 files directly in output directory",
-					"folder", folderName, "outputDir", par2OutputDir)
-			}
-			// If par2OutputDir is empty, CreateInDirectory will use default behavior (temp/source dir)
-
-			createdPar2Paths, err = p.par2runner.CreateInDirectory(ctx, files, par2OutputDir)
-			if err != nil {
-				if !errors.Is(err, context.Canceled) {
-					slog.ErrorContext(ctx, "Error during par2 creation. Upload will continue without par2.", "error", err)
-				}
-				// Continue without PAR2 files
+			// Skip PAR2 generation if option enabled and PAR2 files already exist in source
+			skipGeneration := p.par2Cfg.SkipIfPar2Exists != nil &&
+				*p.par2Cfg.SkipIfPar2Exists && hasPar2Files(files)
+			if skipGeneration {
+				slog.InfoContext(ctx, "Skipping PAR2 generation: existing PAR2 files detected in source folder",
+					"folder", folderName)
 			} else {
-				allFilePaths = append(allFilePaths, createdPar2Paths...)
+				// Determine PAR2 output directory based on maintain_par2_files setting
+				var par2OutputDir string
+				if p.par2Cfg.MaintainPar2Files != nil && *p.par2Cfg.MaintainPar2Files {
+					// For folder posting, PAR2 files go into the folder-specific output subdirectory
+					par2OutputDir = folderOutputDir
+
+					slog.DebugContext(ctx, "Generating PAR2 files directly in output directory",
+						"folder", folderName, "outputDir", par2OutputDir)
+				}
+				// If par2OutputDir is empty, CreateSet will use default behavior (temp/source dir)
+				// folderDir is the on-disk root of the folder; FileDesc paths are computed
+				// relative to it so SABnzbd recreates the tree inside the job folder.
+				folderDir := filepath.Join(rootDir, folderName)
+				par2Res, err = p.par2runner.CreateSet(ctx, files, par2OutputDir, folderName, folderDir)
+				if err != nil {
+					if !errors.Is(err, context.Canceled) {
+						slog.ErrorContext(ctx, "Error during par2 creation. Upload will continue without par2.", "error", err)
+					}
+					// Continue without PAR2 files
+				} else {
+					p.trackGenerated(par2Res)
+					allFilePaths = append(allFilePaths, additionalPar2Paths(par2Res.All(), allFilePaths)...)
+					// par2 set files live at the folder root — basenames in NZB subjects.
+				}
 			}
 		}
 
@@ -517,7 +754,7 @@ func (p *Postie) postFolder(ctx context.Context, files []fileinfo.FileInfo, root
 		}
 
 		// Generate NZB and return with deferred error if present
-		nzbPath := filepath.Join(outputDir, folderName)
+		nzbPath := filepath.Join(folderOutputDir, folderName+".nzb")
 		finalPath, nzbErr := nzbGen.Generate(nzbPath)
 		if nzbErr != nil {
 			return "", fmt.Errorf("error generating NZB file for folder: %w", nzbErr)
@@ -541,29 +778,44 @@ func (p *Postie) postFolder(ctx context.Context, files []fileinfo.FileInfo, root
 				return nil
 			}
 
+			// Skip PAR2 generation if option enabled and PAR2 files already exist in source
+			if p.par2Cfg.SkipIfPar2Exists != nil && *p.par2Cfg.SkipIfPar2Exists && hasPar2Files(files) {
+				slog.InfoContext(ctx, "Skipping PAR2 generation: existing PAR2 files detected in source folder",
+					"folder", folderName)
+				return nil
+			}
+
 			// Determine PAR2 output directory based on maintain_par2_files setting
 			var par2OutputDir string
 			if p.par2Cfg.MaintainPar2Files != nil && *p.par2Cfg.MaintainPar2Files {
-				// For folder posting, PAR2 files go directly in outputDir
-				par2OutputDir = outputDir
+				// For folder posting, PAR2 files go into the folder-specific output subdirectory
+				par2OutputDir = folderOutputDir
 
 				slog.DebugContext(ctx, "Generating PAR2 files directly in output directory",
 					"folder", folderName, "outputDir", par2OutputDir)
 			}
 
-			createdPar2Paths, err = p.par2runner.CreateInDirectory(ctx, files, par2OutputDir)
+			folderDir := filepath.Join(rootDir, folderName)
+			par2Res, err = p.par2runner.CreateSet(ctx, files, par2OutputDir, folderName, folderDir)
 			if err != nil {
 				if !errors.Is(err, context.Canceled) {
 					slog.ErrorContext(ctx, "Error during par2 creation. Upload will continue without par2.", "error", err)
 				}
 				return nil
 			}
+			p.trackGenerated(par2Res)
 
-			// PAR2 files don't need relative paths - use standard Post
-			if err := p.poster.Post(ctx, createdPar2Paths, rootDir, nzbGen); err != nil {
+			// par2 set files live at the folder root — basenames in NZB subjects.
+			par2Paths := additionalPar2Paths(par2Res.All(), allFilePaths)
+			if len(par2Paths) == 0 {
+				return nil
+			}
+			par2RelPaths := map[string]string{}
+			if err := p.poster.PostWithRelativePaths(ctx, par2Paths, rootDir, nzbGen, par2RelPaths); err != nil {
 				if !errors.Is(err, context.Canceled) {
 					slog.ErrorContext(ctx, "Error during upload of par2 files. Upload will continue without par2.", "error", err)
 				}
+				dropPar2FromNZB(nzbGen, par2Paths)
 				return nil
 			}
 			return nil
@@ -589,11 +841,15 @@ func (p *Postie) postFolder(ctx context.Context, files []fileinfo.FileInfo, root
 		if err := errg.Wait(); err != nil {
 			return "", err
 		}
+		// PAR2 errors are optional, but a cancelled job must not complete.
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 	}
 
 	// Generate single NZB file for the entire folder
-	// Use folder name as the base for NZB filename
-	nzbPath := filepath.Join(outputDir, folderName)
+	// Use folder name as the base for NZB filename, placed inside the folder-specific output subdir
+	nzbPath := filepath.Join(folderOutputDir, folderName+".nzb")
 	finalPath, err := nzbGen.Generate(nzbPath)
 	if err != nil {
 		return "", fmt.Errorf("error generating NZB file for folder: %w", err)
@@ -621,21 +877,29 @@ func (p *Postie) postFolder(ctx context.Context, files []fileinfo.FileInfo, root
 
 // ExecutePostUploadScript executes the post-upload script for a completed item
 // This should be called after the file has been marked as completed in the database
-func (p *Postie) ExecutePostUploadScript(ctx context.Context, nzbPath string, itemID string) error {
-	if !p.postUploadScriptCfg.Enabled || p.postUploadScriptCfg.Command == "" {
+func (p *Postie) ExecutePostUploadScript(ctx context.Context, nzbPath string, sourcePath string, itemID string) error {
+	return runPostUploadScript(ctx, p.postUploadScriptCfg, p.queue, nzbPath, sourcePath, itemID)
+}
+
+// runPostUploadScript runs the configured post-upload script and tracks its
+// retry status in the queue. Extracted from ExecutePostUploadScript so the
+// durable verification cleanup path can run the script (after verification) too,
+// not just the upload path. A nil queue skips status tracking; a disabled or
+// empty command is a no-op.
+func runPostUploadScript(ctx context.Context, cfg config.PostUploadScriptConfig, q QueueInterface, nzbPath, sourcePath, itemID string) error {
+	if !cfg.Enabled || cfg.Command == "" {
 		return nil
 	}
 
-	slog.InfoContext(ctx, "Executing post upload script", "command", p.postUploadScriptCfg.Command, "nzb_path", nzbPath, "item_id", itemID)
+	slog.InfoContext(ctx, "Executing post upload script", "command", cfg.Command, "nzb_path", nzbPath, "source_path", sourcePath, "item_id", itemID)
 
-	// Create timeout context
-	timeoutCtx, cancel := context.WithTimeout(ctx, p.postUploadScriptCfg.Timeout.ToDuration())
+	timeoutCtx, cancel := context.WithTimeout(ctx, cfg.Timeout.ToDuration())
 	defer cancel()
 
-	// Replace {nzb_path} placeholder with actual NZB path
-	command := strings.ReplaceAll(p.postUploadScriptCfg.Command, "{nzb_path}", nzbPath)
+	command := strings.ReplaceAll(cfg.Command, "{nzb_path}", nzbPath)
+	command = strings.ReplaceAll(command, "{source_path}", sourcePath)
+	command = strings.ReplaceAll(command, "{source_dir}", filepath.Dir(sourcePath))
 
-	// Parse command using appropriate shell for the OS
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		cmd = exec.CommandContext(timeoutCtx, "cmd", "/C", command)
@@ -643,21 +907,21 @@ func (p *Postie) ExecutePostUploadScript(ctx context.Context, nzbPath string, it
 		cmd = exec.CommandContext(timeoutCtx, "sh", "-c", command)
 	}
 	cmd.Dir = filepath.Dir(nzbPath)
+	// After the timeout kills the shell, stop waiting on output pipes that a
+	// leftover child process still holds open; otherwise CombinedOutput (and the
+	// worker slot) blocks forever.
+	cmd.WaitDelay = 5 * time.Second
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		errorMsg := fmt.Sprintf("script failed: %v, output: %s", err, string(output))
 		slog.ErrorContext(ctx, "Error executing post upload script", "error", err, "output", string(output), "command", command)
 
-		// Track failure in database for retry if queue is available
-		if p.queue != nil {
-			// Calculate next retry time with exponential backoff
-			baseDelay := p.postUploadScriptCfg.RetryDelay.ToDuration()
+		if q != nil {
+			baseDelay := cfg.RetryDelay.ToDuration()
 			now := time.Now()
 			nextRetry := now.Add(baseDelay)
-
-			// This is the first failure, so set firstFailureAt to now
-			if updateErr := p.queue.UpdateScriptStatus(ctx, itemID, "pending_retry", 0, errorMsg, &nextRetry, &now); updateErr != nil {
+			if updateErr := q.UpdateScriptStatus(ctx, itemID, "pending_retry", 0, errorMsg, &nextRetry, &now); updateErr != nil {
 				slog.ErrorContext(ctx, "Failed to track script failure", "error", updateErr)
 			}
 		}
@@ -665,9 +929,8 @@ func (p *Postie) ExecutePostUploadScript(ctx context.Context, nzbPath string, it
 		return fmt.Errorf("post upload script failed: %w", err)
 	}
 
-	// Mark script as completed in database if queue is available
-	if p.queue != nil {
-		if updateErr := p.queue.MarkScriptCompleted(ctx, itemID); updateErr != nil {
+	if q != nil {
+		if updateErr := q.MarkScriptCompleted(ctx, itemID); updateErr != nil {
 			slog.ErrorContext(ctx, "Failed to mark script as completed", "error", updateErr)
 		}
 	}
@@ -675,3 +938,43 @@ func (p *Postie) ExecutePostUploadScript(ctx context.Context, nzbPath string, it
 	slog.InfoContext(ctx, "Post upload script executed successfully", "command", command, "output", string(output))
 	return nil
 }
+
+// deriveFolderName determines the top-level subfolder name from files relative to rootDir.
+// When rootDir is the watch folder and files live under a subfolder (e.g. SingleNzbPerFolder
+// watcher mode or the "Add Folder" button), this returns that subfolder name rather than the
+// watch folder's own name.
+// Falls back to filepath.Base(rootDir) when files are directly in rootDir or when no files
+// are provided. Falls back further to "upload" when rootDir is "/" or otherwise yields an
+// empty/ambiguous name.
+func deriveFolderName(rootDir string, files []fileinfo.FileInfo) string {
+	if len(files) > 0 {
+		relPath, err := filepath.Rel(rootDir, files[0].Path)
+		if err == nil {
+			parts := strings.SplitN(filepath.ToSlash(relPath), "/", 2)
+			if len(parts) > 1 && parts[0] != "." && parts[0] != "" {
+				return parts[0]
+			}
+		}
+	}
+	// Fallback: use the base name of rootDir itself
+	name := filepath.Base(rootDir)
+	if name == "." || name == string(filepath.Separator) || name == "" {
+		return "upload"
+	}
+	return name
+}
+
+// relativePathFrom computes the relative path of filePath's directory from rootDir.
+// Falls back to empty string (placing output directly in outputDir) if paths
+// cannot be made relative (e.g. cross-volume on Windows).
+func relativePathFrom(rootDir, filePath string) string {
+	dirPath := filepath.Dir(filePath)
+	rel, err := filepath.Rel(rootDir, dirPath)
+	if err != nil || rel == "." {
+		return ""
+	}
+	return rel
+}
+
+// ReusedSource reports whether this source reused an existing NZB in the last Post.
+func (p *Postie) ReusedSource(path string) bool { return p != nil && p.reusedSources[path] }
